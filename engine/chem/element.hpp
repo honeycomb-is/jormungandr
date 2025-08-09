@@ -33,6 +33,9 @@ namespace battery::chem
         Element(int atomicNumber,
                 std::string symbol,
                 std::string name,
+                std::string groupLabel,
+                int period,
+                int groupNumber,
                 double atomicMassU,
                 StandardState standardState,
                 Block block,
@@ -48,6 +51,9 @@ namespace battery::chem
             : m_atomicNumber(atomicNumber),
               m_symbol(std::move(symbol)),
               m_name(std::move(name)),
+              m_groupLabel(std::move(groupLabel)),
+              m_period(period),
+              m_groupNumber(groupNumber),
               m_atomicMassU(atomicMassU),
               m_standardState(standardState),
               m_block(block),
@@ -67,6 +73,9 @@ namespace battery::chem
         int atomicNumber() const { return m_atomicNumber; }
         const std::string &symbol() const { return m_symbol; }
         const std::string &name() const { return m_name; }
+        const std::string &groupLabel() const { return m_groupLabel; }
+        int period() const { return m_period; }
+        int groupNumber() const { return m_groupNumber; }
         double atomicMassU() const { return m_atomicMassU; }
         StandardState standardState() const { return m_standardState; }
         Block block() const { return m_block; }
@@ -84,6 +93,9 @@ namespace battery::chem
         int m_atomicNumber{0};
         std::string m_symbol{};
         std::string m_name{};
+        std::string m_groupLabel{};
+        int m_period{0};
+        int m_groupNumber{0};
         double m_atomicMassU{0.0};
         StandardState m_standardState{StandardState::Unknown};
         Block m_block{Block::Unknown};

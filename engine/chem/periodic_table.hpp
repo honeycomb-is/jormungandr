@@ -18,6 +18,8 @@ namespace battery::chem
     public:
         // The periodic table currently defines up to 118 elements.
         static constexpr int kMaxZ = 118;
+        static constexpr int kRows = 7;  // periods
+        static constexpr int kCols = 18; // groups
 
         const Element *getByZ(int z) const
         {

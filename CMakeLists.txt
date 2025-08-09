@@ -11,6 +11,15 @@ add_executable(Honeycomb
 
 target_include_directories(Honeycomb PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Install or copy assets for runtime
+set(ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets")
+set(ASSETS_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/assets")
+file(MAKE_DIRECTORY "${ASSETS_OUT_DIR}")
+set(PERIODIC_TABLE_SOURCE "${ASSETS_DIR}/periodic_table.csv")
+set(PERIODIC_TABLE_DEST   "${ASSETS_OUT_DIR}/elements.csv")
+add_custom_command(TARGET Honeycomb POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PERIODIC_TABLE_SOURCE}" "${PERIODIC_TABLE_DEST}")
+
 # Enable higher warnings for clarity
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
     target_compile_options(Honeycomb PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion)

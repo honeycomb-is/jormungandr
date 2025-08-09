@@ -16,11 +16,14 @@ Game engine for battery chemistry discovery and simulation.
 Honeycomb is a C++23 engine focused on exploring and simulating battery chemistries. It blends an ECS architecture with a data‑driven periodic table and spin‑orbital electron configuration utilities to evaluate anode/cathode candidates and reason about properties relevant to energy storage.
 
 ### Core features
-- ECS-first design for simulation systems
-- Periodic table registry with immutable element properties and fast lookups
-- Electron configuration utilities: spin‑orbitals, spectroscopic notation, valence, Aufbau filling
-- Data-driven element loading (CSV) and formatted reporting
-- CMake build, cross‑platform C++23
+- ECS-first architecture – entities flow through systems such as `BatterySimulationSystem`
+- Immutable periodic-table registry with O(1) lookup by Z/symbol
+- Electron-configuration helpers: spin orbitals, spectroscopic notation, valence counting
+- Flexible CSV loader with schema detection (internal vs. external) and graceful NaN handling
+- Simplified Single Particle Model (SPM) that outputs live KPIs each timestep
+- Periodic-table tensor (7 × 18 × F) for ML/GPU experimentation
+- Human-readable console tables for elements and KPIs
+- CMake build, cross-platform C++23
 
 ---
 
@@ -51,11 +54,13 @@ cmake --build build -j
 ```
 
 ### Example demo output
-The demo prints a per‑element summary (H, Li, C, O, Na, Mg, Al, K, Cu), including:
-- Atomic Mass, Standard State, Electron Configuration, Block
-- Oxidation States, Electronegativity (Pauling), van der Waals radius
-- Ionization Energy, Electron Affinity, Melting/Boiling Points, Density
-It also lists candidate anodes via a simple electronegativity threshold.
+The demo currently performs the following steps:
+
+1. Starts a Single Particle Model discharge and streams a live KPI table:
+
+`Time  Voltage  Current  SoC  Power  Energy`
+
+(Values update each timestep until the cell is empty.)
 
 ### Extend the dataset
 - Add/modify rows in `engine/chem/element_data.hpp` CSV text. Loader will ingest on startup.
@@ -64,10 +69,11 @@ It also lists candidate anodes via a simple electronegativity threshold.
 ---
 
 ### Roadmap
-- Full periodic table coverage (118 elements)
-- Battery KPI computations (voltage, capacity, Wh/kg, Wh/L, round‑trip efficiency)
-- Visualization layer and interactive exploration
-- Save/load scenarios and results
+- Chemistry-specific OCV curves and parameter datasets
+- GPU-accelerated tensor processing and ML-based chemistry recommendations
+- 2D/3D renderer & GUI for interactive battery visualization
+- ECS battery simulation system and scenario save/load
+- Higher fidelity models (SPMe / DFN) and thermal & ageing effects
 
 ### License
 AGPL‑3.0‑or‑later. See `LICENSE`.
