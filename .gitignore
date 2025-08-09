@@ -1,0 +1,107 @@
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Build output (CMake/C++/games)
+build/
+[Bb]uild*/
+bin/
+lib/
+obj/
+out/
+dist/
+.cache/
+cache/
+tmp/
+temp/
+*.log
+logs/
+
+# C/C++ artifacts
+*.o
+*.obj
+*.lo
+*.la
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exp
+*.pdb
+*.ilk
+*.d
+*.dSYM/
+*.su
+*.idb
+*.ipch
+*.pch
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+install_manifest.txt
+Testing/
+.cmake/
+_ninja*/
+.ninja_deps
+.ninja_log
+build.ninja
+rules.ninja
+compile_commands.json
+
+# Xcode / Apple
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/project.xcworkspace/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+DerivedData/
+
+# Visual Studio / MSVC
+.vs/
+*.suo
+*.sdf
+*.opensdf
+*.vcxproj.user
+*.vcxproj.filters
+*.tlog
+
+# IDE/editor
+.vscode/
+.idea/
+*.code-workspace
+.clangd
+
+# Debugging / profiling
+.gdb_history
+.lldb
+.lldbinit
+core
+vgcore.*
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Game/graphics specific compiled assets (source assets should be tracked)
+shaders/**/compiled/
+assets/**/compiled/
+*.spv
+*.metallib
+*.air
+*.pak
+*.pak.*
+
+
