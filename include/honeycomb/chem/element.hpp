@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
-#include <cstdint>
 
-namespace battery::chem
+namespace honeycomb::chem
 {
 
-    enum class Block : uint8_t
+    enum class Block : std::uint8_t
     {
         Unknown = 0,
         S,
@@ -17,7 +17,7 @@ namespace battery::chem
         F
     };
 
-    enum class StandardState : uint8_t
+    enum class StandardState : std::uint8_t
     {
         Unknown = 0,
         Solid,
@@ -33,6 +33,7 @@ namespace battery::chem
         Element(int atomicNumber,
                 std::string symbol,
                 std::string name,
+                std::string cpkHexColor,
                 std::string groupLabel,
                 int period,
                 int groupNumber,
@@ -47,10 +48,12 @@ namespace battery::chem
                 double electronAffinityEV,
                 double meltingPointK,
                 double boilingPointK,
-                double densityGCm3)
+                double densityGCm3,
+                std::string yearDiscovered)
             : m_atomicNumber(atomicNumber),
               m_symbol(std::move(symbol)),
               m_name(std::move(name)),
+              m_cpkHexColor(std::move(cpkHexColor)),
               m_groupLabel(std::move(groupLabel)),
               m_period(period),
               m_groupNumber(groupNumber),
@@ -65,7 +68,8 @@ namespace battery::chem
               m_electronAffinityEV(electronAffinityEV),
               m_meltingPointK(meltingPointK),
               m_boilingPointK(boilingPointK),
-              m_densityGCm3(densityGCm3)
+              m_densityGCm3(densityGCm3),
+              m_yearDiscovered(std::move(yearDiscovered))
         {
         }
 
@@ -73,6 +77,7 @@ namespace battery::chem
         int atomicNumber() const { return m_atomicNumber; }
         const std::string &symbol() const { return m_symbol; }
         const std::string &name() const { return m_name; }
+        const std::string &cpkHexColor() const { return m_cpkHexColor; }
         const std::string &groupLabel() const { return m_groupLabel; }
         int period() const { return m_period; }
         int groupNumber() const { return m_groupNumber; }
@@ -88,11 +93,13 @@ namespace battery::chem
         double meltingPointK() const { return m_meltingPointK; }
         double boilingPointK() const { return m_boilingPointK; }
         double densityGCm3() const { return m_densityGCm3; }
+        const std::string &yearDiscovered() const { return m_yearDiscovered; }
 
     private:
         int m_atomicNumber{0};
         std::string m_symbol{};
         std::string m_name{};
+        std::string m_cpkHexColor{};
         std::string m_groupLabel{};
         int m_period{0};
         int m_groupNumber{0};
@@ -108,6 +115,7 @@ namespace battery::chem
         double m_meltingPointK{0.0};
         double m_boilingPointK{0.0};
         double m_densityGCm3{0.0};
+        std::string m_yearDiscovered{};
     };
 
-} // namespace battery::chem
+} // namespace honeycomb::chem
