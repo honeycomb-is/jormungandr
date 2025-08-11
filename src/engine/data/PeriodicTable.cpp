@@ -1,37 +1,22 @@
 // Periodic table implementation
 #include "engine/data/PeriodicTable.hpp"
-
-#include <fstream>
+#include "engine/data/pt_data.hpp"
 
 namespace Engine::Data
 {
-// Define a default assets root if the build didn't provide one
-#ifndef HONEYCOMB_ASSETS_DIR
-#define HONEYCOMB_ASSETS_DIR "assets"
-#endif
-
-    static std::string ResolvePath()
-    {
-        return std::string(HONEYCOMB_ASSETS_DIR) + "/data/pt.json";
-    }
-
     static PeriodicTable BuildTable()
     {
         PeriodicTable pt;
 
-        // Load JSON array from file
-        std::ifstream f(ResolvePath());
+        // Load JSON array from embedded header
         json arr = json::array();
-        if (f)
+        try
         {
-            try
-            {
-                f >> arr;
-            }
-            catch (...)
-            {
-                arr = json::array();
-            }
+            arr = json::parse(std::string_view(Engine::Data::PT_JSON, Engine::Data::PT_JSON_LEN));
+        }
+        catch (...)
+        {
+            arr = json::array();
         }
 
         pt.elements.reserve(arr.size());

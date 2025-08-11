@@ -42,6 +42,17 @@ if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
     message(STATUS "📝 Including ImGui demo (development build)")
 endif()
 
+# Embed periodic table JSON into a generated header
+file(READ ${CMAKE_SOURCE_DIR}/assets/data/pt.json PT_JSON_CONTENT)
+set(GENERATED_DIR ${CMAKE_BINARY_DIR}/generated)
+set(GENERATED_ENGINE_DATA_DIR ${GENERATED_DIR}/engine/data)
+file(MAKE_DIRECTORY ${GENERATED_ENGINE_DATA_DIR})
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/engine/data/pt_data.hpp.in
+    ${GENERATED_ENGINE_DATA_DIR}/pt_data.hpp
+    @ONLY
+)
+
 # Application sources
 add_executable(Honeycomb
     src/main.mm
@@ -64,6 +75,7 @@ target_include_directories(Honeycomb PRIVATE
     ${IMGUI_DIR}/backends
     src
     packages/json/include
+    ${GENERATED_DIR}
 )
 
 # Build-type specific definitions

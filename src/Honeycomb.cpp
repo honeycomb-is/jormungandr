@@ -5,11 +5,123 @@
 #include "engine/scene/SceneBuilder.hpp"
 #include "engine/render/RenderPrimitives.hpp"
 #include "engine/data/PeriodicTable.hpp"
+#include "engine/ecs/ElementComponents.hpp"
 #include <algorithm>
 #include <vector>
+#include <unordered_map>
+#include <string_view>
+#include <random>
 
 namespace Honeycomb
 {
+
+    // Map noble-gas cores to per-shell electron counts
+    static const std::unordered_map<std::string, std::vector<int>> kNobleCoreShells = {
+        {"He", {2}},               // 1s2
+        {"Ne", {2, 8}},            // 1s2 2s2 2p6
+        {"Ar", {2, 8, 8}},         // [Ne]3s2 3p6
+        {"Kr", {2, 8, 18, 8}},     // [Ar]3d10 4s2 4p6
+        {"Xe", {2, 8, 18, 18, 8}}, // [Kr]4d10 5s2 5p6
+        {"Rn", {2, 8, 18, 32, 18, 8}},
+        {"Og", {2, 8, 18, 32, 32, 18, 8}}};
+
+    static void AccumulateShell(std::vector<int> &shells, int n, int electrons)
+    {
+        if (n <= 0 || electrons <= 0)
+            return;
+        if ((int)shells.size() < n)
+            shells.resize(n, 0);
+        shells[n - 1] += electrons;
+    }
+
+    // Parse electron configuration like "[He]2s2 2p6 3s2" into per-shell occupancy [2, 8, ...]
+    static std::vector<int> ParseElectronConfiguration(const std::string &cfg, int atomicNumber)
+    {
+        std::vector<int> shells;
+        size_t i = 0;
+        while (i < cfg.size())
+        {
+            char c = cfg[i];
+            if (c == '[')
+            {
+                size_t j = cfg.find(']', i + 1);
+                if (j != std::string::npos)
+                {
+                    std::string sym = cfg.substr(i + 1, j - i - 1);
+                    auto it = kNobleCoreShells.find(sym);
+                    if (it != kNobleCoreShells.end())
+                    {
+                        const auto &core = it->second;
+                        if (shells.size() < core.size())
+                            shells.resize(core.size(), 0);
+                        for (size_t k = 0; k < core.size(); ++k)
+                            shells[k] += core[k];
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
+            if (std::isdigit((unsigned char)c))
+            {
+                int n = 0;
+                while (i < cfg.size() && std::isdigit((unsigned char)cfg[i]))
+                {
+                    n = n * 10 + (cfg[i] - '0');
+                    ++i;
+                }
+                // skip orbital letter(s)
+                while (i < cfg.size() && std::isalpha((unsigned char)cfg[i]))
+                {
+                    ++i;
+                }
+                int e = 0;
+                while (i < cfg.size() && std::isdigit((unsigned char)cfg[i]))
+                {
+                    e = e * 10 + (cfg[i] - '0');
+                    ++i;
+                }
+                if (n > 0 && e > 0)
+                    AccumulateShell(shells, n, e);
+                continue;
+            }
+            ++i;
+        }
+        int total = 0;
+        for (int v : shells)
+            total += v;
+        if (total == 0 && atomicNumber > 0)
+        {
+            // Fallback 2n^2 capacity until Z
+            int remaining = atomicNumber;
+            for (int n = 1; n <= 7 && remaining > 0; ++n)
+            {
+                int cap = 2 * n * n;
+                int put = std::min(cap, remaining);
+                AccumulateShell(shells, n, put);
+                remaining -= put;
+            }
+        }
+        return shells;
+    }
+
+    static Engine::Math::Vec3 ShellPlaneNormal(int n)
+    {
+        switch (n % 6)
+        {
+        case 1:
+            return {0, 1, 0};
+        case 2:
+            return {1, 0, 0};
+        case 3:
+            return {0, 0, 1};
+        case 4:
+            return {1, 1, 0};
+        case 5:
+            return {1, 0, 1};
+        default:
+            return {0, 1, 1};
+        }
+    }
 
     void RenderUI()
     {
@@ -106,10 +218,21 @@ namespace Honeycomb
 
         // Static scene and camera state across frames
         static auto scene = Engine::SceneBuilder::CreateDefaultScene();
+        struct SpawnedAtom
+        {
+            int atomIndex;
+            std::vector<int> electronIdx;
+            std::vector<int> orbitalIdx;
+            int Z;
+            std::string symbol;
+            bool alive;
+        };
+        static std::vector<SpawnedAtom> spawned;
         static float yaw = 0.0f;            // smoothed radians around Y
         static float pitch = 0.0f;          // smoothed radians around X
         static float cameraDistance = 5.0f; // smoothed
-        static float yaw_t = 0.0f;          // targets
+        static Engine::Math::Vec3 camTarget{0.0f, 0.0f, 0.0f};
+        static float yaw_t = 0.0f; // targets
         static float pitch_t = 0.0f;
         static float cameraDistance_t = 5.0f;
         static ImVec2 last_mouse = ImVec2(0, 0);
@@ -140,8 +263,11 @@ namespace Honeycomb
 
             bool leftDown = ImGui::IsMouseDown(ImGuiMouseButton_Left);
             bool middleDown = ImGui::IsMouseDown(ImGuiMouseButton_Middle);
+            bool rightDown = ImGui::IsMouseDown(ImGuiMouseButton_Right);
             bool shift = ImGui::GetIO().KeyShift;
-            bool orbiting = (middleDown || (leftDown && !shift));
+            bool ctrl = ImGui::GetIO().KeyCtrl;
+            bool orbiting = (middleDown || rightDown || (leftDown && !shift));
+            bool panning = ((shift || ctrl) && (leftDown || middleDown));
 
             if ((leftDown || middleDown) && !dragging)
             {
@@ -159,11 +285,17 @@ namespace Honeycomb
                 ImVec2 delta = ImVec2(cur.x - last_mouse.x, cur.y - last_mouse.y);
                 last_mouse = cur;
 
-                if (shift && leftDown)
+                if (panning)
                 {
-                    // Translate the atom (and center) in view plane
-                    scene.renderables[0].transform.position.x += delta.x * (1.0f / 200.0f);
-                    scene.renderables[0].transform.position.y -= delta.y * (1.0f / 200.0f);
+                    // Pan camera target in view plane based on pixel delta
+                    float viewHeightAtDist = 2.0f * std::tan(scene.camera.fovYRadians * 0.5f) * cameraDistance;
+                    float pixelsPerWorldY = (vp_h > 0.0f) ? (vp_h / viewHeightAtDist) : 1.0f;
+                    float dy_world = -delta.y / pixelsPerWorldY;
+                    float dx_world = -delta.x / pixelsPerWorldY; // approximate using Y scaling
+                    float cosY = std::cos(yaw), sinY = std::sin(yaw);
+                    Engine::Math::Vec3 right{sinY, 0.0f, cosY};
+                    Engine::Math::Vec3 up{0.0f, 1.0f, 0.0f};
+                    camTarget = camTarget + right * dx_world + up * dy_world;
                 }
                 else if (orbiting)
                 {
@@ -187,9 +319,9 @@ namespace Honeycomb
 
         // Update camera transform from yaw/pitch and distance
         scene.camera.aspect = (vp_h > 0.0f) ? (vp_w / vp_h) : scene.camera.aspect;
-        float cx = cameraDistance * std::cos(pitch) * std::sin(yaw);
-        float cy = cameraDistance * std::sin(pitch);
-        float cz = cameraDistance * std::cos(pitch) * std::cos(yaw);
+        float cx = camTarget.x + cameraDistance * std::cos(pitch) * std::sin(yaw);
+        float cy = camTarget.y + cameraDistance * std::sin(pitch);
+        float cz = camTarget.z + cameraDistance * std::cos(pitch) * std::cos(yaw);
         scene.cameraTransform.position = {cx, cy, cz};
         scene.cameraTransform.rotationEulerRad = {0.0f, 0.0f, 0.0f};
 
@@ -215,7 +347,7 @@ namespace Honeycomb
         // Draw all renderables: backface cull and occlude via painter's sort on max depth
         if (vp_w > 4.0f && vp_h > 4.0f && !scene.renderables.empty())
         {
-            auto V = Engine::Math::lookAt(scene.cameraTransform.position, scene.renderables[0].transform.position, Engine::Math::Vec3{0, 1, 0});
+            auto V = Engine::Math::lookAt(scene.cameraTransform.position, camTarget, Engine::Math::Vec3{0, 1, 0});
             auto P = Engine::Render::ComputeProjectionMatrix(scene.camera);
 
             auto mul4 = [](const Engine::Math::Mat4 &mat, float x, float y, float z)
@@ -245,10 +377,15 @@ namespace Honeycomb
                     continue;
                 if (rend.style == Engine::ECS::RenderStyle::Hidden)
                     continue;
+                // Frustum/clip rejection: quick near/far and simple clip-space check
                 auto M = Engine::Render::ComputeModelMatrix(rend.transform);
                 auto MV = Engine::Math::multiply(V, M);
                 auto MVP = Engine::Math::multiply(P, MV);
 
+                // Compute object center in view space using origin (approx)
+                ImVec4 centerV = mul4(MV, 0.0f, 0.0f, 0.0f);
+                if (centerV.z > -scene.camera.nearPlane || centerV.z < -scene.camera.farPlane)
+                    continue; // behind near plane or beyond far plane
                 const auto &verts = rend.mesh->vertices;
                 const auto &inds = rend.mesh->indices;
                 for (size_t i = 0; i + 2 < inds.size(); i += 3)
@@ -285,9 +422,19 @@ namespace Honeycomb
                     ImVec2 p2 = ImVec2(vp_min.x + ((c2.x / w2) * 0.5f + 0.5f) * vp_w,
                                        vp_min.y + (1.0f - ((c2.y / w2) * 0.5f + 0.5f)) * vp_h);
 
-                    float cr = (v0.cr + v1.cr + v2.cr) / 3.0f;
-                    float cg = (v0.cg + v1.cg + v2.cg) / 3.0f;
-                    float cb = (v0.cb + v1.cb + v2.cb) / 3.0f;
+                    float cr, cg, cb;
+                    if (rend.material.useVertexColor)
+                    {
+                        cr = (v0.cr + v1.cr + v2.cr) / 3.0f;
+                        cg = (v0.cg + v1.cg + v2.cg) / 3.0f;
+                        cb = (v0.cb + v1.cb + v2.cb) / 3.0f;
+                    }
+                    else
+                    {
+                        cr = rend.material.r;
+                        cg = rend.material.g;
+                        cb = rend.material.b;
+                    }
                     auto u8 = [](float c)
                     { int v = (int)(c * 255.0f); if (v<0) v=0; if (v>255) v=255; return (unsigned)v; };
                     int alpha = (int)(rend.opacity.alpha * 255.0f);
@@ -317,21 +464,144 @@ namespace Honeycomb
 
         ImGui::Begin("Elements");
         const auto &elems = Engine::Data::ElementsVec();
-        if (ImGui::BeginTable("ptable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+        // Minecraft-like inventory grid: fixed columns, sequential by atomic number
+        const int cols = 10;
+        int count = static_cast<int>(elems.size());
+        if (ImGui::BeginTable("ptable_grid", cols, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
         {
-            ImGui::TableSetupColumn("Z");
-            ImGui::TableSetupColumn("Symbol");
-            ImGui::TableSetupColumn("Name");
-            ImGui::TableHeadersRow();
-            for (const auto &e : elems)
+            for (int i = 0; i < count; ++i)
             {
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
-                ImGui::Text("%d", e.value("AtomicNumber", 0));
-                ImGui::TableSetColumnIndex(1);
-                ImGui::TextUnformatted(e.value("Symbol", "").c_str());
-                ImGui::TableSetColumnIndex(2);
-                ImGui::TextUnformatted(e.value("Name", "").c_str());
+                if ((i % cols) == 0)
+                    ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(i % cols);
+                const auto &e = elems[i];
+                int Z = e.value("AtomicNumber", 0);
+                const std::string sym = e.value("Symbol", "");
+                const std::string name = e.value("Name", "");
+                ImGui::PushID(Z);
+                ImGui::BeginGroup();
+                if (ImGui::Button(sym.c_str(), ImVec2(-FLT_MIN, 0)))
+                {
+                    // Spawn new atom entity in scene based on element data
+                    Engine::Scene::RenderableEntity atom;
+                    atom.mesh = &scene.resources.atomMesh;
+                    atom.style = Engine::ECS::RenderStyle::Solid;
+                    atom.opacity.alpha = 1.0f;
+                    // Color from CPKHexColor
+                    auto hex = e.value("CPKHexColor", std::string("FFFFFF"));
+                    if (hex.size() >= 6)
+                    {
+                        auto hexVal = [&](char c) -> int
+                        { if (c>='0'&&c<='9') return c-'0'; if(c>='a'&&c<='f') return 10+(c-'a'); if(c>='A'&&c<='F') return 10+(c-'A'); return 0; };
+                        int r = (hexVal(hex[0]) << 4) + hexVal(hex[1]);
+                        int g = (hexVal(hex[2]) << 4) + hexVal(hex[3]);
+                        int b = (hexVal(hex[4]) << 4) + hexVal(hex[5]);
+                        atom.material.useVertexColor = false;
+                        atom.material.r = r / 255.0f;
+                        atom.material.g = g / 255.0f;
+                        atom.material.b = b / 255.0f;
+                    }
+                    // Nucleus radius from vdW radius when available (pm -> scale), else fallback
+                    float nuc = 0.6f;
+                    if (e.contains("AtomicRadius(vdWaals)") && e["AtomicRadius(vdWaals)"].is_number())
+                    {
+                        float pm = e["AtomicRadius(vdWaals)"].get<float>();
+                        float v = pm / 200.0f;
+                        nuc = (v < 0.4f) ? 0.4f : (v > 2.0f ? 2.0f : v);
+                    }
+                    atom.transform.scale = {nuc, nuc, nuc};
+                    // Position: randomized in a plane, spaced and jittered to avoid grouping identicals
+                    static std::mt19937 rng{123456u};
+                    std::uniform_real_distribution<float> jitter(-0.8f, 0.8f);
+                    std::uniform_real_distribution<float> ringAngle(0.0f, 6.283185307f);
+                    std::uniform_int_distribution<int> ringPick(0, 2);
+                    int aliveCount = 0;
+                    for (auto &sa : spawned)
+                        if (sa.alive)
+                            ++aliveCount;
+                    int ring = ringPick(rng) + (aliveCount / 8); // slowly grow radius over time
+                    float radiusPlane = 6.0f + ring * 3.5f;
+                    float a = ringAngle(rng);
+                    float jx = jitter(rng), jy = jitter(rng);
+                    atom.transform.position = {radiusPlane * std::cos(a) + jx, 0.0f, radiusPlane * std::sin(a) + jy};
+                    scene.renderables.push_back(atom);
+                    int atomIndex = static_cast<int>(scene.renderables.size() - 1);
+
+                    // Build electron shells from configuration
+                    std::vector<int> shells = ParseElectronConfiguration(e.value("ElectronConfiguration", std::string()), Z);
+                    SpawnedAtom rec{};
+                    rec.atomIndex = atomIndex;
+                    rec.Z = Z;
+                    rec.symbol = sym;
+                    rec.alive = true;
+                    float baseOrbit = nuc * 1.6f;
+                    for (size_t si = 0; si < shells.size(); ++si)
+                    {
+                        int n = (int)si + 1;
+                        int k = shells[si];
+                        if (k <= 0)
+                            continue;
+                        float r_orbit = baseOrbit * (float)(n * n);
+                        Engine::Math::Vec3 normal = ShellPlaneNormal(n);
+                        for (int ei = 0; ei < k; ++ei)
+                        {
+                            float phase = (2.0f * 3.1415926535f) * (float)ei / (float)k;
+                            Engine::Scene::RenderableEntity eR;
+                            eR.transform.scale = {1.0f, 1.0f, 1.0f};
+                            eR.mesh = &scene.resources.electronMesh;
+                            eR.style = Engine::ECS::RenderStyle::Solid;
+                            eR.opacity.alpha = 0.85f;
+                            scene.renderables.push_back(eR);
+                            int eIndex = static_cast<int>(scene.renderables.size() - 1);
+                            scene.orbitals.push_back(Engine::Scene::Orbital{atomIndex, r_orbit, 1.0f + 0.2f * n, phase, normal, eIndex});
+                            rec.electronIdx.push_back(eIndex);
+                            rec.orbitalIdx.push_back((int)scene.orbitals.size() - 1);
+                        }
+                    }
+                    spawned.push_back(std::move(rec));
+                }
+                ImGui::TextDisabled("%s", name.c_str());
+                // Removal UI: remove most recently spawned of this element
+                {
+                    bool hasOne = false;
+                    for (auto &sa : spawned)
+                        if (sa.alive && sa.symbol == sym)
+                        {
+                            hasOne = true;
+                            break;
+                        }
+                    if (hasOne)
+                    {
+                        if (ImGui::SmallButton("Remove"))
+                        {
+                            for (int idx = (int)spawned.size() - 1; idx >= 0; --idx)
+                            {
+                                auto &sa = spawned[idx];
+                                if (!sa.alive || sa.symbol != sym)
+                                    continue;
+                                if (sa.atomIndex >= 0 && sa.atomIndex < (int)scene.renderables.size())
+                                    scene.renderables[sa.atomIndex].style = Engine::ECS::RenderStyle::Hidden;
+                                for (int ei : sa.electronIdx)
+                                {
+                                    if (ei >= 0 && ei < (int)scene.renderables.size())
+                                        scene.renderables[ei].style = Engine::ECS::RenderStyle::Hidden;
+                                }
+                                for (int oi : sa.orbitalIdx)
+                                {
+                                    if (oi >= 0 && oi < (int)scene.orbitals.size())
+                                    {
+                                        scene.orbitals[oi].centerRenderableIndex = -1;
+                                        scene.orbitals[oi].targetRenderableIndex = -1;
+                                    }
+                                }
+                                sa.alive = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                ImGui::EndGroup();
+                ImGui::PopID();
             }
             ImGui::EndTable();
         }

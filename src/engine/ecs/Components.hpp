@@ -42,8 +42,11 @@ namespace Engine::ECS
 
     struct Material
     {
-        // Placeholder for future shader/material params
-        float dummy{0.0f};
+        // Simple solid color material for CPU renderer
+        float r{1.0f};
+        float g{1.0f};
+        float b{1.0f};
+        bool useVertexColor{true}; // if false, use r/g/b for fill
     };
 
     // Species visual components
