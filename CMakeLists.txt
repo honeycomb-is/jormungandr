@@ -46,6 +46,13 @@ endif()
 add_executable(Honeycomb
     src/main.mm
     src/Honeycomb.cpp
+    src/engine/math/Mat4.hpp
+    src/engine/ecs/Components.hpp
+    src/engine/gfx/MeshFactory.hpp
+    src/engine/scene/Scene.hpp
+    src/engine/scene/SceneBuilder.hpp
+    src/engine/render/RenderPrimitives.hpp
+    src/engine/species/Entities.hpp
     ${IMGUI_SOURCES}
 )
 

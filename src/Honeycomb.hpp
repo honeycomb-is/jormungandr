@@ -4,4 +4,4 @@ namespace Honeycomb
 {
 
     void RenderUI();
-} // namespace Honeycomb
+} // namespace Honeycomb`
