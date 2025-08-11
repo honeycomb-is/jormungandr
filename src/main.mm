@@ -3,6 +3,7 @@
 #include "imgui_impl_metal.h"
 #include <stdio.h>
 #include <string>
+#include <filesystem>
 #include <unistd.h>
 
 #define GLFW_INCLUDE_NONE
@@ -24,16 +25,19 @@ static void glfw_error_callback(int error, const char* description)
 static std::string GetAssetsDirectory()
 {
 #if defined(__APPLE__)
-    @autoreleasepool
-    {
-        NSString *resourcePath = [[NSBundle mainBundle] resourcePath];
-        if (resourcePath != nil)
-        {
-            std::string assets = std::string([resourcePath UTF8String]) + "/assets";
-            return assets;
+    @autoreleasepool {
+        NSBundle* bundle = [NSBundle mainBundle];
+        NSString* resPath = [bundle resourcePath];
+        if (resPath) {
+            NSString* assetsPath = [resPath stringByAppendingPathComponent:@"assets"];
+            BOOL isDir = NO;
+            if ([[NSFileManager defaultManager] fileExistsAtPath:assetsPath isDirectory:&isDir] && isDir) {
+                return std::string([assetsPath UTF8String]);
+            }
         }
     }
 #endif
+    // Fallback to compile-time assets directory (development build)
     return std::string(HONEYCOMB_ASSETS_DIR);
 }
 
@@ -66,20 +70,30 @@ int main(int, char**)
         const std::string default_font_path_str = assets_dir + "/fonts/GoogleSansCode-VariableFont_wght.ttf";
         const char* default_font_path = default_font_path_str.c_str();
         const float default_font_size_px = 18.4f;
-        
-        // Clear any existing fonts and ensure our custom font is the only one loaded
+
         io.Fonts->Clear();
-        
-        // Load our custom font as the primary font
-        ImFont* default_font = io.Fonts->AddFontFromFileTTF(default_font_path, default_font_size_px);
-        if (default_font)
-        {
-            // Explicitly set this font as the default
-            io.FontDefault = default_font;
+
+        bool font_loaded = false;
+#if defined(__APPLE__)
+        @autoreleasepool {
+            NSString* nsFontPath = [NSString stringWithUTF8String:default_font_path];
+            BOOL isDir = NO;
+            if ([[NSFileManager defaultManager] fileExistsAtPath:nsFontPath isDirectory:&isDir] && !isDir) {
+                if (ImFont* f = io.Fonts->AddFontFromFileTTF(default_font_path, default_font_size_px)) {
+                    io.FontDefault = f;
+                    font_loaded = true;
+                }
+            }
         }
-        else
-        {
-            // Fallback to default font if custom font fails
+#else
+        if (std::filesystem::exists(default_font_path)) {
+            if (ImFont* f = io.Fonts->AddFontFromFileTTF(default_font_path, default_font_size_px)) {
+                io.FontDefault = f;
+                font_loaded = true;
+            }
+        }
+#endif
+        if (!font_loaded) {
             io.Fonts->AddFontDefault();
         }
     }
