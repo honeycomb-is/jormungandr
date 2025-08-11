@@ -35,6 +35,9 @@ target_include_directories(Honeycomb PRIVATE
     src
 )
 
+# Provide absolute path to assets for runtime resource loading
+target_compile_definitions(Honeycomb PRIVATE HONEYCOMB_ASSETS_DIR="${CMAKE_SOURCE_DIR}/assets")
+
 target_compile_options(Honeycomb PRIVATE
     $<$<COMPILE_LANGUAGE:OBJCXX>:-Wno-arc-bridge-casts-disallowed-in-nonarc>
 )

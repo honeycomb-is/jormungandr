@@ -102,6 +102,7 @@ namespace Honeycomb
         ImGui::Button("Settings Right");
         static float value = 0.0f;
         ImGui::DragFloat("Value", &value, 0.01f, 0.0f, 1.0f);
+
         ImGui::End();
 
         ImGui::Begin("Viewport");
