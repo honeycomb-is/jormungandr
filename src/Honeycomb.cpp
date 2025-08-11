@@ -4,6 +4,7 @@
 
 #include "engine/scene/SceneBuilder.hpp"
 #include "engine/render/RenderPrimitives.hpp"
+#include "engine/data/PeriodicTable.hpp"
 #include <algorithm>
 #include <vector>
 
@@ -314,8 +315,26 @@ namespace Honeycomb
 
         ImGui::End();
 
-        ImGui::Begin("Inspector");
-        ImGui::Text("Hello World");
+        ImGui::Begin("Elements");
+        const auto &elems = Engine::Data::ElementsVec();
+        if (ImGui::BeginTable("ptable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+        {
+            ImGui::TableSetupColumn("Z");
+            ImGui::TableSetupColumn("Symbol");
+            ImGui::TableSetupColumn("Name");
+            ImGui::TableHeadersRow();
+            for (const auto &e : elems)
+            {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text("%d", e.value("AtomicNumber", 0));
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(e.value("Symbol", "").c_str());
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(e.value("Name", "").c_str());
+            }
+            ImGui::EndTable();
+        }
         ImGui::End();
 
         ImGui::End();

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include "../ecs/Components.hpp"
+#include "../ecs/ElementComponents.hpp"
 
 namespace Engine::Species
 {
@@ -16,9 +17,11 @@ namespace Engine::Species
     struct Atom
     {
         EntityType type{EntityType::Atom};
-        int atomicNumber{1};
+        // Visuals
         Engine::ECS::Radius visualRadius{1.0f};
         int charge_e{0}; // net charge in elementary charges
+        // Element identity and optional properties
+        Engine::ECS::ElementComponentSet element;
     };
 
     struct Electron

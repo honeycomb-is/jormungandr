@@ -48,10 +48,13 @@ add_executable(Honeycomb
     src/Honeycomb.cpp
     src/engine/math/Mat4.hpp
     src/engine/ecs/Components.hpp
+    src/engine/ecs/ElementComponents.hpp
     src/engine/gfx/MeshFactory.hpp
     src/engine/scene/Scene.hpp
     src/engine/scene/SceneBuilder.hpp
     src/engine/render/RenderPrimitives.hpp
+    src/engine/data/PeriodicTable.hpp
+    src/engine/data/PeriodicTable.cpp
     src/engine/species/Entities.hpp
     ${IMGUI_SOURCES}
 )
@@ -60,6 +63,7 @@ target_include_directories(Honeycomb PRIVATE
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
     src
+    packages/json/include
 )
 
 # Build-type specific definitions
