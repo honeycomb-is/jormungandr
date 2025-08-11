@@ -2,6 +2,8 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_metal.h"
 #include <stdio.h>
+#include <string>
+#include <unistd.h>
 
 #define GLFW_INCLUDE_NONE
 #define GLFW_EXPOSE_NATIVE_COCOA
@@ -10,12 +12,29 @@
 
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <Foundation/Foundation.h>
 
 #include "Honeycomb.hpp"
 
 static void glfw_error_callback(int error, const char* description)
 {
     fprintf(stderr, "Glfw Error %d: %s\n", error, description);
+}
+
+static std::string GetAssetsDirectory()
+{
+#if defined(__APPLE__)
+    @autoreleasepool
+    {
+        NSString *resourcePath = [[NSBundle mainBundle] resourcePath];
+        if (resourcePath != nil)
+        {
+            std::string assets = std::string([resourcePath UTF8String]) + "/assets";
+            return assets;
+        }
+    }
+#endif
+    return std::string(HONEYCOMB_ASSETS_DIR);
 }
 
 int main(int, char**)
@@ -43,7 +62,9 @@ int main(int, char**)
 
     // Load application default font
     {
-        const char* default_font_path = HONEYCOMB_ASSETS_DIR "/fonts/GoogleSansCode-VariableFont_wght.ttf";
+        const std::string assets_dir = GetAssetsDirectory();
+        const std::string default_font_path_str = assets_dir + "/fonts/GoogleSansCode-VariableFont_wght.ttf";
+        const char* default_font_path = default_font_path_str.c_str();
         const float default_font_size_px = 18.4f;
         
         // Clear any existing fonts and ensure our custom font is the only one loaded
