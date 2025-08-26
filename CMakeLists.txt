@@ -42,16 +42,7 @@ if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
     message(STATUS "📝 Including ImGui demo (development build)")
 endif()
 
-# Embed periodic table JSON into a generated header
-file(READ ${CMAKE_SOURCE_DIR}/assets/data/pt.json PT_JSON_CONTENT)
-set(GENERATED_DIR ${CMAKE_BINARY_DIR}/generated)
-set(GENERATED_ENGINE_DATA_DIR ${GENERATED_DIR}/engine/data)
-file(MAKE_DIRECTORY ${GENERATED_ENGINE_DATA_DIR})
-configure_file(
-    ${CMAKE_SOURCE_DIR}/src/engine/data/pt_data.hpp.in
-    ${GENERATED_ENGINE_DATA_DIR}/pt_data.hpp
-    @ONLY
-)
+## Periodic table data embedding removed for the worm robot project
 
 # Application sources
 add_executable(Honeycomb
@@ -59,13 +50,10 @@ add_executable(Honeycomb
     src/Honeycomb.cpp
     src/engine/math/Mat4.hpp
     src/engine/ecs/Components.hpp
-    src/engine/ecs/ElementComponents.hpp
     src/engine/gfx/MeshFactory.hpp
     src/engine/scene/Scene.hpp
     src/engine/scene/SceneBuilder.hpp
     src/engine/render/RenderPrimitives.hpp
-    src/engine/data/PeriodicTable.hpp
-    src/engine/data/PeriodicTable.cpp
     src/engine/species/Entities.hpp
     ${IMGUI_SOURCES}
 )
@@ -74,8 +62,6 @@ target_include_directories(Honeycomb PRIVATE
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
     src
-    packages/json/include
-    ${GENERATED_DIR}
 )
 
 # Build-type specific definitions

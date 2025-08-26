@@ -18,17 +18,28 @@ namespace Engine::SceneBuilder
         scene.camera.nearPlane = 0.05f;
         scene.camera.farPlane = 5000.0f; // extend far plane for large scenes
 
-        // Shared meshes: atom (bigger, medium LOD), electron (smaller, LOD=1 per request)
-        scene.resources.atomMesh = Engine::Gfx::CreateSphereUV(12, 16, 1.0f);
-        scene.resources.electronMesh = Engine::Gfx::CreateSpeciesSphere(0.2f, 1); // lod 1
+        // Create a simple cylinder mesh representing the first Jörmungandr segment
+        // Diameter ~150mm -> radius 0.075m, choose segment length ~0.6m
+        scene.resources.wormSegmentMesh = Engine::Gfx::CreateCylinder(0.075f, 0.6f, 64, true);
 
-        // Force electron mesh vertex color to neutral (white)
-        for (auto &v : scene.resources.electronMesh.vertices)
-        {
-            v.cr = v.cg = v.cb = 1.0f;
-        }
+        // Add a single renderable Jörmungandr segment at the origin
+        Engine::Scene::RenderableEntity segment;
+        segment.transform.position = {0.0f, 0.0f, 0.0f};
+        segment.transform.rotationEulerRad = {0.0f, 0.0f, 0.0f};
+        segment.transform.scale = {1.0f, 1.0f, 1.0f};
+        segment.mesh = &scene.resources.wormSegmentMesh;
+        segment.material.useVertexColor = false;
+        // Cutter head color: red
+        segment.material.r = 1.0f;
+        segment.material.g = 0.12f;
+        segment.material.b = 0.12f;
+        segment.style = Engine::ECS::RenderStyle::Solid;
+        segment.opacity.alpha = 1.0f;
+        scene.renderables.push_back(segment);
 
-        // Start with an empty scene (no atoms) – user will spawn atoms from the Elements grid
+        // Tooth primitive (thin box); size will be scaled/placed per-tooth in UI
+        scene.resources.toothBoxMesh = Engine::Gfx::CreateBox(0.02f, 0.01f, 0.02f);
+
         return scene;
     }
 
