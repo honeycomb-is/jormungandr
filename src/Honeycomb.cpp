@@ -60,6 +60,10 @@ namespace Honeycomb
             ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dockspace_flags);
         }
 
+        // Top menubar
+        static bool reqStartDrill = false, reqStop = false, reqResetScene = false, reqClearPath = false;
+        static bool reqPlanLeft = false, reqPlanRight = false, reqPlanDown = false, reqPlanUp = false;
+        static bool reqPeriReset = false, reqPeriJam = false, reqPeriEStop = false, reqPeriAutoToggle = false;
         if (ImGui::BeginMenuBar())
         {
             if (ImGui::BeginMenu("Options"))
@@ -96,6 +100,44 @@ namespace Honeycomb
                 ImGui::EndMenu();
             }
 
+            if (ImGui::BeginMenu("Controls"))
+            {
+                if (ImGui::MenuItem("Start Drill"))
+                    reqStartDrill = true;
+                if (ImGui::MenuItem("Stop"))
+                    reqStop = true;
+                ImGui::Separator();
+                if (ImGui::MenuItem("Plan 90° Left"))
+                    reqPlanLeft = true;
+                if (ImGui::MenuItem("Plan 90° Right"))
+                    reqPlanRight = true;
+                if (ImGui::MenuItem("Plan 90° Down"))
+                    reqPlanDown = true;
+                if (ImGui::MenuItem("Plan 90° Up"))
+                    reqPlanUp = true;
+                ImGui::Separator();
+                if (ImGui::MenuItem("Clear Path"))
+                { /* handled later after statics are declared */
+                    reqClearPath = true;
+                }
+                if (ImGui::MenuItem("Reset Scene"))
+                    reqResetScene = true;
+                ImGui::EndMenu();
+            }
+
+            if (ImGui::BeginMenu("Peristalsis"))
+            {
+                if (ImGui::MenuItem("RESET → IDLE"))
+                    reqPeriReset = true;
+                if (ImGui::MenuItem("JAM"))
+                    reqPeriJam = true;
+                if (ImGui::MenuItem("EMERGENCY STOP"))
+                    reqPeriEStop = true;
+                if (ImGui::MenuItem("Toggle Auto-Cycle"))
+                    reqPeriAutoToggle = true;
+                ImGui::EndMenu();
+            }
+
             ImGui::EndMenuBar();
         }
 
@@ -109,6 +151,20 @@ namespace Honeycomb
         ImVec2 vp_max = ImVec2(win_pos.x + content_max.x, win_pos.y + content_max.y);
         float vp_w = vp_max.x - vp_min.x;
         float vp_h = vp_max.y - vp_min.y;
+        // Anti-aliasing / smoothing controls
+        static bool aa_lines = true;
+        static bool aa_fill = true;
+        static bool aa_pixel_snap = true;
+        if (aa_lines)
+            dl->Flags |= ImDrawListFlags_AntiAliasedLines;
+        else
+            dl->Flags &= ~ImDrawListFlags_AntiAliasedLines;
+        if (aa_fill)
+            dl->Flags |= ImDrawListFlags_AntiAliasedFill;
+        else
+            dl->Flags &= ~ImDrawListFlags_AntiAliasedFill;
+        ImGui::GetStyle().AntiAliasedLines = aa_lines;
+        ImGui::GetStyle().AntiAliasedFill = aa_fill;
         dl->AddRect(vp_min, vp_max, IM_COL32(80, 80, 80, 255));
 
         // Static scene and camera state across frames
@@ -144,14 +200,148 @@ namespace Honeycomb
         static std::vector<int> toothIndices;                        // indices of tooth renderables in scene.renderables
         static float sj_pitch_deg = 0.0f, sj_yaw_deg = 0.0f;         // targets from input
         static float sj_pitch_cur_deg = 0.0f, sj_yaw_cur_deg = 0.0f; // rate-limited applied
-        static float sj_pitch_lim_deg = 18.0f, sj_yaw_lim_deg = 18.0f;
+        // Unlimited operator steering; limits removed per operator responsibility
         static float yawZeroBase_deg = 0.0f, pitchZeroBase_deg = 0.0f;
         static bool spinning = false;
         static float forward_gain_m_per_rev = 0.01f;               // advance per revolution
         static float minBendRadius_m = 1.5f;                       // curvature limit
         static float yawRateDeg_s = 25.0f, pitchRateDeg_s = 25.0f; // base steering rates
-        // Peristalsis FSM (stub): 0=RearLock, 1=Extend, 2=FrontLock, 3=Retract
-        static int peristalsisState = 1;
+        // Peristalsis FSM
+        enum class PeriState : int
+        {
+            IDLE = 0,
+            ANCHOR_LOCK = 1,
+            STROKE = 2,
+            MID_LOCK = 3,
+            RETRACT = 4,
+            JAM_RECOVERY = 5,
+            EMERGENCY_STOP = 6,
+        };
+        enum class PeriEvent : int
+        {
+            FRONT_LOCKED = 0,
+            STROKE_DONE = 1,
+            MID_LOCKED = 2,
+            RETRACT_DONE = 3,
+            JAM = 4,
+            EMERGENCY_STOP = 5,
+            RESET = 6,
+        };
+        static PeriState peristalsisState = PeriState::IDLE;
+        static bool peristalsisAuto = false;
+        static float periElapsedSec = 0.0f;
+        static float periT_AnchorLock = 0.8f;
+        static float periT_Stroke = 1.8f;
+        static float periT_MidLock = 0.6f;
+        static float periT_Retract = 1.2f;
+        auto periStateName = [&](PeriState s) -> const char *
+        {
+            switch (s)
+            {
+            case PeriState::IDLE:
+                return "IDLE";
+            case PeriState::ANCHOR_LOCK:
+                return "ANCHOR LOCK";
+            case PeriState::STROKE:
+                return "STROKE";
+            case PeriState::MID_LOCK:
+                return "MID LOCK";
+            case PeriState::RETRACT:
+                return "RETRACT";
+            case PeriState::JAM_RECOVERY:
+                return "JAM RECOVERY";
+            case PeriState::EMERGENCY_STOP:
+                return "EMERGENCY STOP";
+            }
+            return "?";
+        };
+        auto periColor = [&](PeriState s) -> ImU32
+        {
+            switch (s)
+            {
+            case PeriState::IDLE:
+                return IM_COL32(200, 200, 210, 230);
+            case PeriState::ANCHOR_LOCK:
+                return IM_COL32(255, 180, 80, 230);
+            case PeriState::STROKE:
+                return IM_COL32(120, 255, 140, 230);
+            case PeriState::MID_LOCK:
+                return IM_COL32(120, 220, 255, 230);
+            case PeriState::RETRACT:
+                return IM_COL32(250, 235, 120, 230);
+            case PeriState::JAM_RECOVERY:
+                return IM_COL32(255, 150, 60, 230);
+            case PeriState::EMERGENCY_STOP:
+                return IM_COL32(255, 80, 80, 230);
+            }
+            return IM_COL32(220, 220, 220, 230);
+        };
+        auto periHandleEvent = [&](PeriEvent ev)
+        {
+            // RESET always returns to IDLE
+            if (ev == PeriEvent::RESET)
+            {
+                peristalsisState = PeriState::IDLE;
+                periElapsedSec = 0.0f;
+                return;
+            }
+            // JAM/E-STOP preempt from any state
+            if (ev == PeriEvent::JAM)
+            {
+                peristalsisState = PeriState::JAM_RECOVERY;
+                periElapsedSec = 0.0f;
+                return;
+            }
+            if (ev == PeriEvent::EMERGENCY_STOP)
+            {
+                peristalsisState = PeriState::EMERGENCY_STOP;
+                periElapsedSec = 0.0f;
+                return;
+            }
+            // Normal loop
+            switch (peristalsisState)
+            {
+            case PeriState::IDLE:
+                if (ev == PeriEvent::FRONT_LOCKED)
+                {
+                    peristalsisState = PeriState::ANCHOR_LOCK;
+                    periElapsedSec = 0.0f;
+                }
+                break;
+            case PeriState::ANCHOR_LOCK:
+                if (ev == PeriEvent::FRONT_LOCKED)
+                {
+                    peristalsisState = PeriState::STROKE;
+                    periElapsedSec = 0.0f;
+                }
+                break;
+            case PeriState::STROKE:
+                if (ev == PeriEvent::STROKE_DONE)
+                {
+                    peristalsisState = PeriState::MID_LOCK;
+                    periElapsedSec = 0.0f;
+                }
+                break;
+            case PeriState::MID_LOCK:
+                if (ev == PeriEvent::MID_LOCKED)
+                {
+                    peristalsisState = PeriState::RETRACT;
+                    periElapsedSec = 0.0f;
+                }
+                break;
+            case PeriState::RETRACT:
+                if (ev == PeriEvent::RETRACT_DONE)
+                {
+                    peristalsisState = PeriState::ANCHOR_LOCK;
+                    periElapsedSec = 0.0f;
+                }
+                break;
+            case PeriState::JAM_RECOVERY:
+            case PeriState::EMERGENCY_STOP:
+                // only RESET handled above
+                break;
+            }
+        };
         // Autopilot: drill forward target meters
         static bool autopilotActive = false;
         static float autopilotTarget_m = 0.0f;
@@ -197,10 +387,11 @@ namespace Honeycomb
             float pitchDeg;
         };
         static std::deque<Pose> poseDeque;
-        static float segmentSpacing_m = 0.5f;
+        static float segmentSpacing_m = 0.5f;     // base spacing (not used directly for collision-free placement)
+        static float trail_length_m = 0.5f;       // realistic trailing segment center length (capsule)
+        static float spacing_clearance_m = 0.03f; // small gap to prevent overlap
         static int numTrailingSegments = 4;
         static std::vector<int> trailingIdx; // indices of trailing segment renderables
-        static int anchorIdx = -1, thrustIdx = -1;
 
         auto smoothTowards = [&](float current, float target, float dt, float tau)
         {
@@ -306,14 +497,7 @@ namespace Honeycomb
                 sj_pitch_deg += steerRateDeg * dt;
             if (ImGui::IsKeyDown(ImGuiKey_S) || ImGui::IsKeyDown(ImGuiKey_DownArrow))
                 sj_pitch_deg -= steerRateDeg * dt;
-            if (sj_pitch_deg > sj_pitch_lim_deg)
-                sj_pitch_deg = sj_pitch_lim_deg;
-            if (sj_pitch_deg < -sj_pitch_lim_deg)
-                sj_pitch_deg = -sj_pitch_lim_deg;
-            if (sj_yaw_deg > sj_yaw_lim_deg)
-                sj_yaw_deg = sj_yaw_lim_deg;
-            if (sj_yaw_deg < -sj_yaw_lim_deg)
-                sj_yaw_deg = -sj_yaw_lim_deg;
+            // No clamps: operator is responsible for respecting physical limits
         }
 
         // Prevent camera from moving "into" the worm segment by clamping distance
@@ -327,27 +511,27 @@ namespace Honeycomb
 
             const Engine::Math::Vec3 wormPos = scene.renderables[0].transform.position;
             // Estimate bounding sphere radius from current mesh (scaled)
-            float maxR = 0.0f;
-            float maxScale = 1.0f;
+            float headMaxR = 0.0f;
+            float headMaxScale = 1.0f;
             {
-                const auto &mesh = scene.resources.wormSegmentMesh;
+                const auto &mesh = scene.resources.headMesh;
                 for (const auto &v : mesh.vertices)
                 {
                     float r2 = v.px * v.px + v.py * v.py + v.pz * v.pz;
-                    if (r2 > maxR)
-                        maxR = r2;
+                    if (r2 > headMaxR)
+                        headMaxR = r2;
                 }
-                maxR = (maxR > 0.0f) ? std::sqrt(maxR) : 0.0f;
+                headMaxR = (headMaxR > 0.0f) ? std::sqrt(headMaxR) : 0.0f;
                 const auto &s = scene.renderables[0].transform.scale;
-                maxScale = std::max({std::abs(s.x), std::abs(s.y), std::abs(s.z)});
+                headMaxScale = std::max({std::abs(s.x), std::abs(s.y), std::abs(s.z)});
             }
-            float boundRadius = maxR * maxScale;
+            float headBoundRadius = headMaxR * headMaxScale;
             float margin = std::max(0.02f, scene.camera.nearPlane * 2.0f);
 
             // Sphere-ray intersection from camTarget toward camera
             Engine::Math::Vec3 oc = {camTarget.x - wormPos.x, camTarget.y - wormPos.y, camTarget.z - wormPos.z};
             float b = Engine::Math::dot(d, oc);
-            float c = Engine::Math::dot(oc, oc) - boundRadius * boundRadius;
+            float c = Engine::Math::dot(oc, oc) - headBoundRadius * headBoundRadius;
             float disc = b * b - c;
             if (disc >= 0.0f)
             {
@@ -370,12 +554,25 @@ namespace Honeycomb
             {
                 // Check nearest few poses
                 int checkN = std::min((int)poseDeque.size(), 24);
+                // Compute a bound radius for trailing segments (capsule mesh)
+                float trailMaxR = 0.0f;
+                {
+                    const auto &tmesh = scene.resources.trailingCapsuleMesh;
+                    for (const auto &v : tmesh.vertices)
+                    {
+                        float r2 = v.px * v.px + v.py * v.py + v.pz * v.pz;
+                        if (r2 > trailMaxR)
+                            trailMaxR = r2;
+                    }
+                    trailMaxR = (trailMaxR > 0.0f) ? std::sqrt(trailMaxR) : 0.0f;
+                }
+                float trailBoundRadius = trailMaxR; // trailing segments use unit scale
                 for (int i = 0; i < checkN; ++i)
                 {
                     Engine::Math::Vec3 p = poseDeque[i].p;
                     Engine::Math::Vec3 occ = {camTarget.x - p.x, camTarget.y - p.y, camTarget.z - p.z};
                     float bb = Engine::Math::dot(d, occ);
-                    float cc = Engine::Math::dot(occ, occ) - boundRadius * boundRadius;
+                    float cc = Engine::Math::dot(occ, occ) - trailBoundRadius * trailBoundRadius;
                     float dd = bb * bb - cc;
                     if (dd >= 0.0f)
                     {
@@ -448,7 +645,7 @@ namespace Honeycomb
             float maxYawStep = yawRateDeg_s * rateScale * dt;
             float maxPitStep = pitchRateDeg_s * rateScale * dt;
             // Curvature limit: allowed combined angular rate ~ v / Rmin
-            float mps_inst = (spinning && ui_rpm > 0.0f && peristalsisState == 1) ? ((ui_rpm / 60.0f) * forward_gain_m_per_rev) : 0.0f;
+            float mps_inst = (spinning && ui_rpm > 0.0f && peristalsisState == PeriState::STROKE) ? ((ui_rpm / 60.0f) * forward_gain_m_per_rev) : 0.0f;
             float allowedRateDeg = (minBendRadius_m > 0.01f) ? (mps_inst / minBendRadius_m * 57.2957795f) : 180.0f;
             if (maxYawStep > allowedRateDeg * dt)
                 maxYawStep = allowedRateDeg * dt;
@@ -466,8 +663,15 @@ namespace Honeycomb
                 head.transform.rotationEulerRad = {pr, yr, cutter_phase};
             }
 
-            // Advance head forward along its current local +Z if spinning with RPM
-            if (spinning && ui_rpm > 0.0f && peristalsisState == 1)
+            // Advance head forward along its current local +Z if spinning with RPM and peristalsis allows
+            bool allowAdvance = true;
+            if (peristalsisState == PeriState::IDLE || peristalsisState == PeriState::EMERGENCY_STOP)
+                allowAdvance = false;
+            if (peristalsisState == PeriState::JAM_RECOVERY)
+                allowAdvance = false;
+            if (peristalsisState == PeriState::RETRACT)
+                allowAdvance = false;
+            if (spinning && ui_rpm > 0.0f && allowAdvance)
             {
                 float mps = (ui_rpm / 60.0f) * forward_gain_m_per_rev; // m/s
                 float speedScale = 1.0f / (1.0f + 0.7f * resist);
@@ -492,8 +696,8 @@ namespace Honeycomb
                 lastHeadPosForProgress = head.transform.position;
                 if (autopilotActive && apPlan.empty() && autopilotTarget_m > 0.0f && autopilotProgress_m >= autopilotTarget_m)
                 {
-                    spinning = false;     // stop cutting
-                    peristalsisState = 0; // lock
+                    spinning = false;                   // stop cutting
+                    peristalsisState = PeriState::IDLE; // lock
                     autopilotActive = false;
                 }
 
@@ -669,7 +873,7 @@ namespace Honeycomb
                 for (int i = (int)trailingIdx.size(); i < numTrailingSegments; ++i)
                 {
                     Engine::Scene::RenderableEntity seg;
-                    seg.mesh = &scene.resources.wormSegmentMesh;
+                    seg.mesh = &scene.resources.trailingCapsuleMesh;
                     seg.material.useVertexColor = false;
                     seg.material.r = 0.65f;
                     seg.material.g = 0.65f;
@@ -711,7 +915,16 @@ namespace Honeycomb
 
             for (int i = 0; i < (int)trailingIdx.size(); ++i)
             {
-                float sBack = (i + 1) * segmentSpacing_m;
+                // Place centers separated by head length and trail length, plus a small clearance
+                float sBack = 0.0f;
+                if (i == 0)
+                {
+                    sBack = (ui_length_m * 0.5f) + (trail_length_m * 0.5f) + spacing_clearance_m;
+                }
+                else
+                {
+                    sBack = (ui_length_m * 0.5f) + (trail_length_m * 0.5f) + spacing_clearance_m + i * (trail_length_m + spacing_clearance_m);
+                }
                 Pose p{};
                 if (samplePoseAt(sBack, p))
                 {
@@ -738,47 +951,124 @@ namespace Honeycomb
                 }
             }
 
-            // Simple Anchor and Thrust visuals (solid, same mesh/material style as trailing)
-            if (anchorIdx < 0 || thrustIdx < 0)
+            // Removed Anchor/Thrust extra visuals
+        }
+
+        // Peristalsis auto progression (timed)
+        periElapsedSec += dt;
+        if (peristalsisAuto)
+        {
+            switch (peristalsisState)
             {
-                // Anchor
-                Engine::Scene::RenderableEntity anc;
-                anc.mesh = &scene.resources.wormSegmentMesh;
-                anc.material.useVertexColor = false;
-                anc.material.r = 0.65f;
-                anc.material.g = 0.65f;
-                anc.material.b = 0.68f;
-                anc.opacity.alpha = 0.08f;
-                anc.style = Engine::ECS::RenderStyle::Solid;
-                scene.renderables.push_back(anc);
-                anchorIdx = (int)scene.renderables.size() - 1;
-                // Thrust
-                Engine::Scene::RenderableEntity thr;
-                thr.mesh = &scene.resources.wormSegmentMesh;
-                thr.material.useVertexColor = false;
-                thr.material.r = 0.65f;
-                thr.material.g = 0.65f;
-                thr.material.b = 0.68f;
-                thr.opacity.alpha = 0.08f;
-                thr.style = Engine::ECS::RenderStyle::Solid;
-                scene.renderables.push_back(thr);
-                thrustIdx = (int)scene.renderables.size() - 1;
+            case PeriState::IDLE:
+                if (spinning && ui_rpm > 0.0f)
+                    periHandleEvent(PeriEvent::FRONT_LOCKED);
+                break;
+            case PeriState::ANCHOR_LOCK:
+                if (periElapsedSec >= periT_AnchorLock)
+                    periHandleEvent(PeriEvent::FRONT_LOCKED);
+                break;
+            case PeriState::STROKE:
+                if (periElapsedSec >= periT_Stroke)
+                    periHandleEvent(PeriEvent::STROKE_DONE);
+                break;
+            case PeriState::MID_LOCK:
+                if (periElapsedSec >= periT_MidLock)
+                    periHandleEvent(PeriEvent::MID_LOCKED);
+                break;
+            case PeriState::RETRACT:
+                if (periElapsedSec >= periT_Retract)
+                    periHandleEvent(PeriEvent::RETRACT_DONE);
+                break;
+            case PeriState::JAM_RECOVERY:
+            case PeriState::EMERGENCY_STOP:
+                break;
             }
-            // Place anchor/thrust roughly following first trailing poses
-            Pose pA{}, pT{};
-            samplePoseAt(segmentSpacing_m * (numTrailingSegments + 1), pA);
-            samplePoseAt(segmentSpacing_m * (numTrailingSegments + 2), pT);
-            if (anchorIdx >= 0)
+        }
+
+        // Apply deferred menu actions now that statics and handlers exist
+        if (reqClearPath)
+        {
+            headPath.clear();
+            lastPathSample = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
+            reqClearPath = false;
+        }
+        if (reqPeriReset)
+        {
+            periHandleEvent(PeriEvent::RESET);
+            reqPeriReset = false;
+        }
+        if (reqPeriJam)
+        {
+            periHandleEvent(PeriEvent::JAM);
+            reqPeriJam = false;
+        }
+        if (reqPeriEStop)
+        {
+            periHandleEvent(PeriEvent::EMERGENCY_STOP);
+            reqPeriEStop = false;
+        }
+        if (reqPeriAutoToggle)
+        {
+            peristalsisAuto = !peristalsisAuto;
+            reqPeriAutoToggle = false;
+        }
+
+        // Reset Scene via menu
+        if (reqResetScene)
+        {
+            reqResetScene = false;
+            yaw = 0.0f;
+            pitch = 0.0f;
+            cameraDistance = 5.0f;
+            yaw_t = 0.0f;
+            pitch_t = 0.0f;
+            cameraDistance_t = 5.0f;
+            camTarget = Engine::Math::Vec3{0.0f, 0.0f, 0.0f};
+            ui_radius_m = 0.075f;
+            ui_length_m = 0.6f;
+            ui_teeth = 16;
+            ui_profile_idx = 0;
+            ui_rpm = 0.0f;
+            cutter_phase = 0.0f;
+            toothIndices.clear();
+            sj_pitch_deg = 0.0f;
+            sj_yaw_deg = 0.0f;
+            sj_pitch_cur_deg = 0.0f;
+            sj_yaw_cur_deg = 0.0f;
+            yawZeroBase_deg = 0.0f;
+            pitchZeroBase_deg = 0.0f;
+            spinning = false;
+            peristalsisState = PeriState::IDLE;
+            autopilotActive = false;
+            autopilotTarget_m = 0.0f;
+            autopilotProgress_m = 0.0f;
+            lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
+            apPlan.clear();
+            apIndex = -1;
+            apSegProgress_m = 0.0f;
+            apHoldYaw_deg = 0.0f;
+            gridZero = Engine::Math::Vec3{0.0f, 0.0f, 0.0f};
+            headPath.clear();
+            lastPathSample = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
+            poseDeque.clear();
+            trailingIdx.clear();
+            scene = Engine::SceneBuilder::CreateDefaultScene();
+            scene.resources.headMesh = Engine::Gfx::CreateCylinder(ui_radius_m, ui_length_m, 64, true);
+            if (!scene.renderables.empty())
             {
-                auto &anc = scene.renderables[anchorIdx];
-                anc.transform.position = pA.p;
-                anc.transform.rotationEulerRad = {pA.pitchDeg * 3.1415926535f / 180.0f, pA.yawDeg * 3.1415926535f / 180.0f, 0.0f};
-            }
-            if (thrustIdx >= 0)
-            {
-                auto &thr = scene.renderables[thrustIdx];
-                thr.transform.position = pT.p;
-                thr.transform.rotationEulerRad = {pT.pitchDeg * 3.1415926535f / 180.0f, pT.yawDeg * 3.1415926535f / 180.0f, 0.0f};
+                auto &headR = scene.renderables[0];
+                headR.mesh = &scene.resources.headMesh;
+                headR.material.useVertexColor = false;
+                headR.material.r = 1.0f;
+                headR.material.g = 0.12f;
+                headR.material.b = 0.12f;
+                headR.style = Engine::ECS::RenderStyle::Solid;
+                headR.opacity.alpha = 1.0f;
+                headR.transform.position = {0.0f, 0.0f, 0.0f};
+                headR.transform.rotationEulerRad = {0.0f, 0.0f, 0.0f};
+                headR.transform.scale = {1.0f, 1.0f, 1.0f};
+                camTarget = headR.transform.position;
             }
         }
 
@@ -884,52 +1174,69 @@ namespace Honeycomb
             std::sort(tris.begin(), tris.end(), [](const TriScr &a, const TriScr &b)
                       { return a.zsort < b.zsort; });
 
-            // Draw
-            for (const auto &t : tris)
+            // Draw with optional MSAA-like supersample resolve (simple 2x jitter blend)
+            bool enableSupersample = true;
+            if (!enableSupersample)
             {
-                if (t.wire)
-                    dl->AddTriangle(t.p0, t.p1, t.p2, t.color, 0.8f);
-                else
-                    dl->AddTriangleFilled(t.p0, t.p1, t.p2, t.color);
+                for (const auto &t : tris)
+                {
+                    if (t.wire)
+                        dl->AddTriangle(t.p0, t.p1, t.p2, t.color, 0.8f);
+                    else
+                        dl->AddTriangleFilled(t.p0, t.p1, t.p2, t.color);
+                }
+            }
+            else
+            {
+                ImVec2 jitter[2] = {ImVec2(0.25f, 0.25f), ImVec2(-0.25f, -0.25f)};
+                for (int pass = 0; pass < 2; ++pass)
+                {
+                    ImVec2 j = jitter[pass];
+                    for (const auto &t : tris)
+                    {
+                        ImVec2 p0 = ImVec2(t.p0.x + j.x, t.p0.y + j.y);
+                        ImVec2 p1 = ImVec2(t.p1.x + j.x, t.p1.y + j.y);
+                        ImVec2 p2 = ImVec2(t.p2.x + j.x, t.p2.y + j.y);
+                        ImU32 col = (pass == 0) ? (t.color & 0x00FFFFFF) | (((((t.color >> 24) & 0xFF) / 2) & 0xFF) << 24)
+                                                : t.color;
+                        if (t.wire)
+                            dl->AddTriangle(p0, p1, p2, col, 0.8f);
+                        else
+                            dl->AddTriangleFilled(p0, p1, p2, col);
+                    }
+                }
             }
         }
 
-        // Controls overlay in main viewport
+        // Minimal overlay (telemetry + planned segments when autopilot plan exists)
         {
             ImVec2 panel_min = ImVec2(vp_min.x + 8.0f, vp_min.y + 8.0f);
             float line_h = ImGui::GetFontSize() + 2.0f;
             int upcoming = 0;
             if (apIndex >= 0 && apIndex < (int)apPlan.size())
-            {
                 upcoming = std::min(6, (int)apPlan.size() - apIndex);
-            }
-            int lines = 8 + (upcoming > 0 ? (1 + upcoming) : 0);
-            ImVec2 panel_max = ImVec2(panel_min.x + 340.0f, panel_min.y + line_h * lines + 8.0f);
-            dl->AddRectFilled(panel_min, panel_max, IM_COL32(0, 0, 0, 140), 4.0f);
-            dl->AddRect(panel_min, panel_max, IM_COL32(255, 255, 255, 30), 4.0f, 0, 1.0f);
+            int num_lines = 4 + (upcoming > 0 ? (1 + upcoming) : 0);
+            ImVec2 panel_max = ImVec2(panel_min.x + 360.0f, panel_min.y + line_h * num_lines + 8.0f);
+            dl->AddRectFilled(panel_min, panel_max, IM_COL32(0, 0, 0, 110), 4.0f);
+            dl->AddRect(panel_min, panel_max, IM_COL32(255, 255, 255, 24), 4.0f, 0, 1.0f);
             ImVec2 tp = ImVec2(panel_min.x + 8.0f, panel_min.y + 6.0f);
-            auto addLine = [&](const char *txt, ImU32 col)
-            {
-                dl->AddText(tp, col, txt);
-                tp.y += line_h;
-            };
             char buf[128];
-            addLine("Controls", IM_COL32(255, 255, 255, 230));
-            addLine("Space: Toggle Spin", IM_COL32(235, 235, 240, 220));
-            addLine("+ / -: RPM +/-", IM_COL32(235, 235, 240, 220));
-            addLine("A/D or Left/Right: Yaw", IM_COL32(235, 235, 240, 220));
-            addLine("W/S or Up/Down: Pitch", IM_COL32(235, 235, 240, 220));
-            addLine("Forward only when spinning", IM_COL32(255, 120, 120, 220));
+            dl->AddText(tp, IM_COL32(255, 255, 255, 230), "Telemetry");
+            tp.y += line_h;
             float mps = (spinning && ui_rpm > 0.0f) ? ((ui_rpm / 60.0f) * forward_gain_m_per_rev) : 0.0f;
-            snprintf(buf, sizeof(buf), "RPM: %.1f  Spinning: %s  Speed: %.3f m/s", ui_rpm, (spinning ? "On" : "Off"), mps);
-            addLine(buf, IM_COL32(225, 225, 235, 220));
+            snprintf(buf, sizeof(buf), "RPM: %.1f  Speed: %.3f m/s", ui_rpm, mps);
+            dl->AddText(tp, IM_COL32(225, 225, 235, 220), buf);
+            tp.y += line_h;
             snprintf(buf, sizeof(buf), "Yaw: %.1f deg  Pitch: %.1f deg", sj_yaw_deg, sj_pitch_deg);
-            addLine(buf, IM_COL32(225, 225, 235, 220));
-
-            // Upcoming autopilot events
+            dl->AddText(tp, IM_COL32(225, 225, 235, 220), buf);
+            tp.y += line_h;
+            snprintf(buf, sizeof(buf), "Peristalsis: %s%s", periStateName(peristalsisState), peristalsisAuto ? " (AUTO)" : "");
+            dl->AddText(tp, periColor(peristalsisState), buf);
+            tp.y += line_h;
             if (upcoming > 0)
             {
-                addLine("Plan (next):", IM_COL32(200, 230, 255, 230));
+                dl->AddText(tp, IM_COL32(200, 230, 255, 230), "Plan (next):");
+                tp.y += line_h;
                 for (int k = 0; k < upcoming; ++k)
                 {
                     const auto &seg = apPlan[apIndex + k];
@@ -939,14 +1246,15 @@ namespace Honeycomb
                         if (k == 0)
                             len = std::max(0.0f, seg.length_m - apSegProgress_m);
                         snprintf(buf, sizeof(buf), "  %sStraight %.2fm", (k == 0 ? "> " : ""), len);
-                        addLine(buf, IM_COL32(180, 255, 180, 230));
+                        dl->AddText(tp, IM_COL32(180, 255, 180, 230), buf);
                     }
                     else
                     {
                         const char *axis = seg.pitchAxis ? "Pitch" : "Yaw";
                         snprintf(buf, sizeof(buf), "  %sTurn %s %+0.0fdeg", (k == 0 ? "> " : ""), axis, seg.targetAbsDeg);
-                        addLine(buf, seg.pitchAxis ? IM_COL32(240, 180, 255, 230) : IM_COL32(180, 220, 255, 230));
+                        dl->AddText(tp, seg.pitchAxis ? IM_COL32(240, 180, 255, 230) : IM_COL32(180, 220, 255, 230), buf);
                     }
+                    tp.y += line_h;
                 }
             }
         }
@@ -963,6 +1271,9 @@ namespace Honeycomb
         ImVec2 gv_max = ImVec2(win_pos2.x + content_max2.x, win_pos2.y + content_max2.y);
         float gv_w = gv_max.x - gv_min.x;
         float gv_h = gv_max.y - gv_min.y;
+        // Enable anti-aliasing for grid
+        dlGrid->Flags |= ImDrawListFlags_AntiAliasedLines;
+        dlGrid->Flags |= ImDrawListFlags_AntiAliasedFill;
         dlGrid->AddRect(gv_min, gv_max, IM_COL32(70, 70, 70, 255));
 
         if (gv_w > 4.0f && gv_h > 4.0f)
@@ -1405,91 +1716,38 @@ namespace Honeycomb
         }
         ImGui::End();
 
-        // Head-Centered Grid Settings (GPR/SONAR-like neighborhood)
-        ImGui::Begin("Head-Centered Grid Settings");
-        if (ImGui::Button("Zero Origin To Head"))
-        {
-            if (!scene.renderables.empty())
-                gridZero = scene.renderables[0].transform.position;
-            // Reset yaw/pitch baseline so subsequent commands are relative to new zero
-            yawZeroBase_deg = sj_yaw_cur_deg;
-            pitchZeroBase_deg = sj_pitch_cur_deg;
-            sj_yaw_deg = 0.0f;
-            sj_pitch_deg = 0.0f;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Clear Path"))
-        {
-            headPath.clear();
-            lastPathSample = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
-        }
-        ImGui::End();
-
-        // (Removed duplicate "Operator" window to avoid ID conflicts)
-        // Micro-Borer parameters window: adjust radius and length of the segment
-        ImGui::Begin("Micro-Borer Parameters");
-        bool changed = false;
-        ImGui::TextUnformatted("Cutter Head");
-        // Tint sliders red for the cutter head controls
-        ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0.95f, 0.15f, 0.15f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(1.00f, 0.10f, 0.10f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.40f, 0.10f, 0.10f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.32f, 0.08f, 0.08f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.25f, 0.06f, 0.06f, 1.0f));
-        changed |= ImGui::SliderFloat("Radius (m)", &ui_radius_m, 0.03f, 0.20f, "%.3f");
-        changed |= ImGui::SliderFloat("Length (m)", &ui_length_m, 0.10f, 2.00f, "%.3f");
-        // Cutter head teeth and RPM
-        ImGui::SliderInt("Teeth", &ui_teeth, 4, 64);
-        ImGui::SliderFloat("RPM", &ui_rpm, 0.0f, 600.0f, "%.1f");
-        ImGui::PopStyleColor(5);
-        // Tooth profile selection
-        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.40f, 0.10f, 0.10f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.50f, 0.12f, 0.12f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.60f, 0.16f, 0.16f, 1.0f));
-        ImGui::Combo("Tooth Profile", &ui_profile_idx, kProfiles, (int)(sizeof(kProfiles) / sizeof(kProfiles[0])));
-        ImGui::PopStyleColor(3);
-        // Telemetry
-        ImGui::Separator();
-        ImGui::TextUnformatted("Telemetry");
-        ImGui::Text("RPM: %.1f", ui_rpm);
-        if (changed)
-        {
-            // Rebuild the cylinder mesh with new parameters
-            scene.resources.wormSegmentMesh = Engine::Gfx::CreateCylinder(ui_radius_m, ui_length_m, 64, true);
-        }
-        ImGui::End();
-
-        ImGui::End();
-
-        // Operator controls (extend with obstacle avoidance)
-        ImGui::Begin("Operator");
+        // Controls window (consolidated)
+        ImGui::Begin("Controls");
         ImGui::Checkbox("Autopilot", &autopilotActive);
         ImGui::SameLine();
         ImGui::TextDisabled("Bend R>=%.2fm", minBendRadius_m);
-        ImGui::TextUnformatted("Simple Forward");
-        ImGui::SliderFloat("Target Forward (m)", &autopilotTarget_m, 0.0f, 50.0f, "%.2f");
-        if (ImGui::Button("Start Drill"))
-        {
-            apPlan.clear();
-            apIndex = -1;
-            apSegProgress_m = 0.0f;
-            autopilotActive = true;
-            autopilotProgress_m = 0.0f;
-            lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
-            spinning = true;
-            peristalsisState = 1; // Extend
-        }
+        ImGui::Separator();
+        ImGui::TextUnformatted("RPM");
+        ImGui::SliderFloat("##RPM", &ui_rpm, 0.0f, 600.0f, "%.1f");
+        ImGui::Separator();
+        ImGui::TextUnformatted("Peristalsis");
+        ImGui::Checkbox("Auto-Cycle", &peristalsisAuto);
         ImGui::SameLine();
-        if (ImGui::Button("Stop"))
-        {
-            apPlan.clear();
-            apIndex = -1;
-            apSegProgress_m = 0.0f;
-            autopilotActive = false;
-            spinning = false;
-            peristalsisState = 0;
-        }
-        ImGui::Text("Progress: %.2f / %.2f m", autopilotProgress_m, autopilotTarget_m);
+        ImGui::Text("State: %s", periStateName(peristalsisState));
+        if (ImGui::Button("RESET → IDLE"))
+            periHandleEvent(PeriEvent::RESET);
+        ImGui::SameLine();
+        if (ImGui::Button("JAM"))
+            periHandleEvent(PeriEvent::JAM);
+        ImGui::SameLine();
+        if (ImGui::Button("EMERGENCY STOP"))
+            periHandleEvent(PeriEvent::EMERGENCY_STOP);
+        if (ImGui::Button("FRONT LOCKED"))
+            periHandleEvent(PeriEvent::FRONT_LOCKED);
+        ImGui::SameLine();
+        if (ImGui::Button("STROKE DONE"))
+            periHandleEvent(PeriEvent::STROKE_DONE);
+        ImGui::SameLine();
+        if (ImGui::Button("MID LOCKED"))
+            periHandleEvent(PeriEvent::MID_LOCKED);
+        ImGui::SameLine();
+        if (ImGui::Button("RETRACT DONE"))
+            periHandleEvent(PeriEvent::RETRACT_DONE);
         ImGui::Separator();
         ImGui::TextUnformatted("Obstacle Avoid (90°)");
         ImGui::Checkbox("Show Obstacle", &obstacleVisible);
@@ -1499,50 +1757,10 @@ namespace Honeycomb
         ImGui::SliderFloat("Obstacle Radius (m)", &obstacleRadius_m, 0.05f, 5.0f, "%.2f");
         ImGui::SliderFloat("Clearance (m)", &obstacleClearance_m, 0.05f, 2.0f, "%.2f");
         ImGui::SliderFloat("Turn Radius (m)", &autopilotTurnRadius_m, 0.5f, 8.0f, "%.2f");
-        ImGui::Separator();
-        if (ImGui::Button("Reset Scene"))
+        // Mirror plan requests here so menu items trigger these too
+        if (reqPlanLeft || ImGui::Button("Plan 90° Left"))
         {
-            yaw = 0.0f;
-            pitch = 0.0f;
-            cameraDistance = 5.0f;
-            yaw_t = 0.0f;
-            pitch_t = 0.0f;
-            cameraDistance_t = 5.0f;
-            camTarget = Engine::Math::Vec3{0.0f, 0.0f, 0.0f};
-            ui_radius_m = 0.075f;
-            ui_length_m = 0.6f;
-            ui_teeth = 16;
-            ui_profile_idx = 0;
-            ui_rpm = 0.0f;
-            cutter_phase = 0.0f;
-            toothIndices.clear();
-            sj_pitch_deg = 0.0f;
-            sj_yaw_deg = 0.0f;
-            sj_pitch_cur_deg = 0.0f;
-            sj_yaw_cur_deg = 0.0f;
-            yawZeroBase_deg = 0.0f;
-            pitchZeroBase_deg = 0.0f;
-            spinning = false;
-            peristalsisState = 1;
-            autopilotActive = false;
-            autopilotTarget_m = 0.0f;
-            autopilotProgress_m = 0.0f;
-            lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
-            apPlan.clear();
-            apIndex = -1;
-            apSegProgress_m = 0.0f;
-            apHoldYaw_deg = 0.0f;
-            gridZero = Engine::Math::Vec3{0.0f, 0.0f, 0.0f};
-            headPath.clear();
-            lastPathSample = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
-            poseDeque.clear();
-            trailingIdx.clear();
-            anchorIdx = -1;
-            thrustIdx = -1;
-            scene = Engine::SceneBuilder::CreateDefaultScene();
-        }
-        if (ImGui::Button("Plan 90° Left"))
-        {
+            reqPlanLeft = false;
             if (!scene.renderables.empty())
             {
                 autopilotTurnRadius_m = std::max(autopilotTurnRadius_m, minBendRadius_m);
@@ -1557,40 +1775,17 @@ namespace Honeycomb
                 float margin = obstacleRadius_m + obstacleClearance_m + autopilotTurnRadius_m;
                 float L1 = std::max(forwardDist - margin, 0.0f);
                 float L2 = 2.0f * margin;
-                bool append = autopilotActive && !apPlan.empty();
-                float baseYaw = sj_yaw_cur_deg;
-                float basePitch = sj_pitch_cur_deg;
-                if (append)
-                {
-                    // accumulate final planned orientation from remaining segments
-                    baseYaw = apHoldYaw_deg;
-                    basePitch = apHoldPitch_deg;
-                    for (int ii = apIndex; ii < (int)apPlan.size(); ++ii)
-                    {
-                        const auto &segp = apPlan[ii];
-                        if (segp.kind == SegTurn)
-                        {
-                            if (segp.pitchAxis)
-                                basePitch = segp.targetAbsDeg;
-                            else
-                                baseYaw = segp.targetAbsDeg;
-                        }
-                    }
-                }
-                else
-                {
-                    apPlan.clear();
-                    apIndex = 0;
-                    apSegProgress_m = 0.0f;
-                    apHoldYaw_deg = baseYaw;
-                    apHoldPitch_deg = basePitch;
-                    autopilotActive = true;
-                    spinning = true;
-                    peristalsisState = 1;
-                    autopilotProgress_m = 0.0f;
-                    lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
-                }
-                float startYaw = baseYaw;
+                apPlan.clear();
+                apIndex = 0;
+                apSegProgress_m = 0.0f;
+                apHoldYaw_deg = sj_yaw_cur_deg;
+                apHoldPitch_deg = sj_pitch_cur_deg;
+                autopilotActive = true;
+                spinning = true;
+                peristalsisState = PeriState::STROKE;
+                autopilotProgress_m = 0.0f;
+                lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
+                float startYaw = apHoldYaw_deg;
                 if (L1 > 0.02f)
                     apPlan.push_back({SegStraight, L1, false, 0.0f});
                 apPlan.push_back({SegTurn, 0.0f, false, startYaw + 90.0f});
@@ -1599,8 +1794,9 @@ namespace Honeycomb
             }
         }
         ImGui::SameLine();
-        if (ImGui::Button("Plan 90° Right"))
+        if (reqPlanRight || ImGui::Button("Plan 90° Right"))
         {
+            reqPlanRight = false;
             if (!scene.renderables.empty())
             {
                 autopilotTurnRadius_m = std::max(autopilotTurnRadius_m, minBendRadius_m);
@@ -1615,39 +1811,17 @@ namespace Honeycomb
                 float margin = obstacleRadius_m + obstacleClearance_m + autopilotTurnRadius_m;
                 float L1 = std::max(forwardDist - margin, 0.0f);
                 float L2 = 2.0f * margin;
-                bool append = autopilotActive && !apPlan.empty();
-                float baseYaw = sj_yaw_cur_deg;
-                float basePitch = sj_pitch_cur_deg;
-                if (append)
-                {
-                    baseYaw = apHoldYaw_deg;
-                    basePitch = apHoldPitch_deg;
-                    for (int ii = apIndex; ii < (int)apPlan.size(); ++ii)
-                    {
-                        const auto &segp = apPlan[ii];
-                        if (segp.kind == SegTurn)
-                        {
-                            if (segp.pitchAxis)
-                                basePitch = segp.targetAbsDeg;
-                            else
-                                baseYaw = segp.targetAbsDeg;
-                        }
-                    }
-                }
-                else
-                {
-                    apPlan.clear();
-                    apIndex = 0;
-                    apSegProgress_m = 0.0f;
-                    apHoldYaw_deg = baseYaw;
-                    apHoldPitch_deg = basePitch;
-                    autopilotActive = true;
-                    spinning = true;
-                    peristalsisState = 1;
-                    autopilotProgress_m = 0.0f;
-                    lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
-                }
-                float startYaw = baseYaw;
+                apPlan.clear();
+                apIndex = 0;
+                apSegProgress_m = 0.0f;
+                apHoldYaw_deg = sj_yaw_cur_deg;
+                apHoldPitch_deg = sj_pitch_cur_deg;
+                autopilotActive = true;
+                spinning = true;
+                peristalsisState = PeriState::STROKE;
+                autopilotProgress_m = 0.0f;
+                lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
+                float startYaw = apHoldYaw_deg;
                 if (L1 > 0.02f)
                     apPlan.push_back({SegStraight, L1, false, 0.0f});
                 apPlan.push_back({SegTurn, 0.0f, false, startYaw - 90.0f});
@@ -1655,9 +1829,9 @@ namespace Honeycomb
                 apPlan.push_back({SegTurn, 0.0f, false, startYaw});
             }
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Plan 90° Down"))
+        if (reqPlanDown || ImGui::Button("Plan 90° Down"))
         {
+            reqPlanDown = false;
             if (!scene.renderables.empty())
             {
                 autopilotTurnRadius_m = std::max(autopilotTurnRadius_m, minBendRadius_m);
@@ -1672,39 +1846,17 @@ namespace Honeycomb
                 float margin = obstacleRadius_m + obstacleClearance_m + autopilotTurnRadius_m;
                 float L1 = std::max(forwardDist - margin, 0.0f);
                 float L2 = 2.0f * margin;
-                bool append = autopilotActive && !apPlan.empty();
-                float baseYaw = sj_yaw_cur_deg;
-                float basePitch = sj_pitch_cur_deg;
-                if (append)
-                {
-                    baseYaw = apHoldYaw_deg;
-                    basePitch = apHoldPitch_deg;
-                    for (int ii = apIndex; ii < (int)apPlan.size(); ++ii)
-                    {
-                        const auto &segp = apPlan[ii];
-                        if (segp.kind == SegTurn)
-                        {
-                            if (segp.pitchAxis)
-                                basePitch = segp.targetAbsDeg;
-                            else
-                                baseYaw = segp.targetAbsDeg;
-                        }
-                    }
-                }
-                else
-                {
-                    apPlan.clear();
-                    apIndex = 0;
-                    apSegProgress_m = 0.0f;
-                    apHoldYaw_deg = baseYaw;
-                    apHoldPitch_deg = basePitch;
-                    autopilotActive = true;
-                    spinning = true;
-                    peristalsisState = 1;
-                    autopilotProgress_m = 0.0f;
-                    lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
-                }
-                float startPitch = basePitch;
+                apPlan.clear();
+                apIndex = 0;
+                apSegProgress_m = 0.0f;
+                apHoldYaw_deg = sj_yaw_cur_deg;
+                apHoldPitch_deg = sj_pitch_cur_deg;
+                autopilotActive = true;
+                spinning = true;
+                peristalsisState = PeriState::STROKE;
+                autopilotProgress_m = 0.0f;
+                lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
+                float startPitch = apHoldPitch_deg;
                 if (L1 > 0.02f)
                     apPlan.push_back({SegStraight, L1, true, 0.0f});
                 apPlan.push_back({SegTurn, 0.0f, true, startPitch + 90.0f});
@@ -1713,8 +1865,9 @@ namespace Honeycomb
             }
         }
         ImGui::SameLine();
-        if (ImGui::Button("Plan 90° Up"))
+        if (reqPlanUp || ImGui::Button("Plan 90° Up"))
         {
+            reqPlanUp = false;
             if (!scene.renderables.empty())
             {
                 autopilotTurnRadius_m = std::max(autopilotTurnRadius_m, minBendRadius_m);
@@ -1729,39 +1882,17 @@ namespace Honeycomb
                 float margin = obstacleRadius_m + obstacleClearance_m + autopilotTurnRadius_m;
                 float L1 = std::max(forwardDist - margin, 0.0f);
                 float L2 = 2.0f * margin;
-                bool append = autopilotActive && !apPlan.empty();
-                float baseYaw = sj_yaw_cur_deg;
-                float basePitch = sj_pitch_cur_deg;
-                if (append)
-                {
-                    baseYaw = apHoldYaw_deg;
-                    basePitch = apHoldPitch_deg;
-                    for (int ii = apIndex; ii < (int)apPlan.size(); ++ii)
-                    {
-                        const auto &segp = apPlan[ii];
-                        if (segp.kind == SegTurn)
-                        {
-                            if (segp.pitchAxis)
-                                basePitch = segp.targetAbsDeg;
-                            else
-                                baseYaw = segp.targetAbsDeg;
-                        }
-                    }
-                }
-                else
-                {
-                    apPlan.clear();
-                    apIndex = 0;
-                    apSegProgress_m = 0.0f;
-                    apHoldYaw_deg = baseYaw;
-                    apHoldPitch_deg = basePitch;
-                    autopilotActive = true;
-                    spinning = true;
-                    peristalsisState = 1;
-                    autopilotProgress_m = 0.0f;
-                    lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
-                }
-                float startPitch = basePitch;
+                apPlan.clear();
+                apIndex = 0;
+                apSegProgress_m = 0.0f;
+                apHoldYaw_deg = sj_yaw_cur_deg;
+                apHoldPitch_deg = sj_pitch_cur_deg;
+                autopilotActive = true;
+                spinning = true;
+                peristalsisState = PeriState::STROKE;
+                autopilotProgress_m = 0.0f;
+                lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
+                float startPitch = apHoldPitch_deg;
                 if (L1 > 0.02f)
                     apPlan.push_back({SegStraight, L1, true, 0.0f});
                 apPlan.push_back({SegTurn, 0.0f, true, startPitch - 90.0f});
@@ -1769,6 +1900,38 @@ namespace Honeycomb
                 apPlan.push_back({SegTurn, 0.0f, true, startPitch});
             }
         }
+        ImGui::Separator();
+        ImGui::TextUnformatted("Autopilot");
+        ImGui::SliderFloat("Target Forward (m)", &autopilotTarget_m, 0.0f, 50.0f, "%.2f");
+        if (reqStartDrill || ImGui::Button("Start Drill"))
+        {
+            reqStartDrill = false;
+            apPlan.clear();
+            apIndex = -1;
+            apSegProgress_m = 0.0f;
+            autopilotActive = true;
+            autopilotProgress_m = 0.0f;
+            lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
+            spinning = true;
+            peristalsisState = PeriState::STROKE;
+        }
+        ImGui::SameLine();
+        if (reqStop || ImGui::Button("Stop"))
+        {
+            reqStop = false;
+            apPlan.clear();
+            apIndex = -1;
+            apSegProgress_m = 0.0f;
+            autopilotActive = false;
+            spinning = false;
+            peristalsisState = PeriState::IDLE;
+        }
+        ImGui::Text("Progress: %.2f / %.2f m", autopilotProgress_m, autopilotTarget_m);
+        ImGui::End();
+
+        // Micro-Borer Parameters removed (length/radius/tooth profile)
+
+        // End main dockspace window
         ImGui::End();
     }
 } // namespace Honeycomb

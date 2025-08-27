@@ -18,16 +18,17 @@ namespace Engine::SceneBuilder
         scene.camera.nearPlane = 0.05f;
         scene.camera.farPlane = 5000.0f; // extend far plane for large scenes
 
-        // Create a simple cylinder mesh representing the first Jörmungandr segment
-        // Diameter ~150mm -> radius 0.075m, choose segment length ~0.6m
-        scene.resources.wormSegmentMesh = Engine::Gfx::CreateCylinder(0.075f, 0.6f, 64, true);
+        // Create meshes: head cylinder and trailing capsule segments
+        // Diameter ~150mm -> radius 0.075m. Head default length ~0.6m, trailing ~0.5m
+        scene.resources.headMesh = Engine::Gfx::CreateCylinder(0.075f, 0.6f, 64, true);
+        scene.resources.trailingCapsuleMesh = Engine::Gfx::CreateTrailingCapsule(0.075f, 0.5f, 64);
 
         // Add a single renderable Jörmungandr segment at the origin
         Engine::Scene::RenderableEntity segment;
         segment.transform.position = {0.0f, 0.0f, 0.0f};
         segment.transform.rotationEulerRad = {0.0f, 0.0f, 0.0f};
         segment.transform.scale = {1.0f, 1.0f, 1.0f};
-        segment.mesh = &scene.resources.wormSegmentMesh;
+        segment.mesh = &scene.resources.headMesh;
         segment.material.useVertexColor = false;
         // Cutter head color: red
         segment.material.r = 1.0f;

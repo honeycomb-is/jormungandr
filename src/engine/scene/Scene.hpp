@@ -23,7 +23,8 @@ namespace Engine::Scene
 
     struct SceneResources
     {
-        MeshData wormSegmentMesh;
+        MeshData headMesh;
+        MeshData trailingCapsuleMesh;
         MeshData toothBoxMesh;
     };
 
