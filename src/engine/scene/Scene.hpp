@@ -23,6 +23,11 @@ namespace Engine::Scene
 
     struct SceneResources
     {
+        // Trolley dashboard meshes
+        MeshData chassisMesh;
+        MeshData wheelMesh;
+        MeshData groundMesh;
+        // Legacy fields kept to avoid breaking existing code paths
         MeshData headMesh;
         MeshData trailingCapsuleMesh;
         MeshData toothBoxMesh;

@@ -67,4 +67,11 @@ namespace Engine::ECS
         float alpha{1.0f};
     };
 
+    // Dashboard: simple movable rigid for kinematics-only viz
+    struct KinematicBody
+    {
+        Vec3 linearVelocity{0.0f, 0.0f, 0.0f};
+        Vec3 angularVelocity{0.0f, 0.0f, 0.0f}; // rad/s about x,y,z
+    };
+
 } // namespace Engine::ECS

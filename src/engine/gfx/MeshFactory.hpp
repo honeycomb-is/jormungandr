@@ -125,6 +125,22 @@ namespace Engine::Gfx
         return m;
     }
 
+    // Simple XZ plane centered at origin with size sx by sz (two triangles)
+    inline MeshData CreatePlane(float sx, float sz)
+    {
+        MeshData m;
+        float hx = sx * 0.5f;
+        float hz = sz * 0.5f;
+        // Four corners
+        m.vertices.push_back(VertexPC{-hx, 0.0f, -hz, 0.65f, 0.65f, 0.68f});
+        m.vertices.push_back(VertexPC{+hx, 0.0f, -hz, 0.65f, 0.65f, 0.68f});
+        m.vertices.push_back(VertexPC{+hx, 0.0f, +hz, 0.65f, 0.65f, 0.68f});
+        m.vertices.push_back(VertexPC{-hx, 0.0f, +hz, 0.65f, 0.65f, 0.68f});
+        // Two triangles
+        m.indices.insert(m.indices.end(), {0u, 1u, 2u, 0u, 2u, 3u});
+        return m;
+    }
+
     inline MeshData CreateConeFrustum(float r0, float r1, float length, int slices = 32, bool capped = true)
     {
         MeshData m;

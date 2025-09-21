@@ -16,7 +16,58 @@
 namespace Honeycomb
 {
 
-    // Removed periodic table and electron configuration utilities
+    // Dashboard data models and simple simulation helpers
+    struct Inputs
+    {
+        float payloadKg = 40.0f;
+        float speed_mps = 0.6f;
+        float slope_deg = 2.0f;
+        float mu = 0.425f; // friction coefficient (worst-case default)
+        float battCapacity_Ah = 40.0f;
+        float battVoltage_V = 24.0f;
+        float dischargeC = 1.0f;
+        float armPayloadKg = 2.0f;
+    };
+
+    struct Outputs
+    {
+        float wheelTorque_Nm = 0.0f;
+        float stoppingDistance_m = 0.0f;
+        float runtime_hours = 0.0f;
+    };
+
+    namespace Sim
+    {
+        constexpr float g = 9.80665f;
+        inline float ComputeStoppingDistance(float speed_mps, float mu, float slope_deg)
+        {
+            float slope = slope_deg * 3.1415926535f / 180.0f;
+            float a_fric = mu * g * std::cos(slope);
+            float a_grav = g * std::sin(slope);
+            float a = a_fric - a_grav;
+            if (a <= 0.01f)
+                a = 0.01f;
+            return (speed_mps * speed_mps) / (2.0f * a);
+        }
+        inline float ComputeWheelTorquePerWheel(float payloadKg, float speed_mps, float slope_deg, float mu, int numWheels)
+        {
+            float slope = slope_deg * 3.1415926535f / 180.0f;
+            float mass = payloadKg + 20.0f; // trolley mass approx
+            float F_slope = mass * g * std::sin(slope);
+            float F_rr = mu * mass * g * 0.01f;
+            float F_total = F_slope + F_rr + 0.2f * mass * speed_mps;
+            float wheelRadius = 0.15f;
+            float torqueTotal = F_total * wheelRadius;
+            return torqueTotal / std::max(1, numWheels);
+        }
+        inline float EstimateRuntimeHours(float Ah, float V, float dischargeC, float currentA)
+        {
+            float capA = Ah * std::max(0.5f, 1.0f - 0.1f * (dischargeC - 1.0f));
+            if (currentA <= 0.01f)
+                return 12.0f;
+            return capA / currentA;
+        }
+    }
 
     void RenderUI()
     {
@@ -60,6 +111,770 @@ namespace Honeycomb
             ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dockspace_flags);
         }
 
+        // 2D dashboard mode: free-body diagram and engineering plots
+        {
+            static Inputs inputs{};
+            // Geometry in millimeters (mm)
+            static float wheelbase_mm = 900.0f;
+            static float cgFromRear_mm = 450.0f;
+            static float cgHeight_mm = 350.0f;
+            static float wheelRadius_mm = 150.0f;
+            static float c_rr = 0.015f;
+            static float rho_air = 1.2f;
+            static float CdA = 0.6f;
+            static int driveMode = 2; // 0=FWD,1=RWD,2=AWD
+            static bool motorEnabled = true;
+            static bool brakesApplied = false;
+            static float actualSpeed_mps = 0.0f;
+            static float velocityX_mps = 0.0f; // velocity components
+            static float velocityY_mps = 0.0f;
+            static float accelX_mps2 = 0.0f; // acceleration components
+            static float accelY_mps2 = 0.0f;
+            static float positionX_m = 0.0f; // trolley world position
+            static float positionY_m = 0.0f;
+
+            // Motor specifications
+            static float motorPower_W = 250.0f;
+            static float motorMaxTorque_Nm = 15.0f;
+            static float motorMaxRPM = 3000.0f;
+            static float motorEfficiency = 0.85f;
+
+            // Axle and drivetrain
+            static float axleDiameter_mm = 20.0f;
+            static float axleMaterial_tensileStrength_MPa = 400.0f; // Steel
+            static float gearReduction = 10.0f;
+            static float chainEfficiency = 0.95f;
+
+            // Trolley dimensions
+            static float trolleyWidth_mm = 600.0f;
+            static float trolleyHeight_mm = 800.0f;
+            static float deckHeight_mm = 200.0f;
+            static float groundClearance_mm = 50.0f;
+
+            // Wheel specifications
+            static float wheelWidth_mm = 50.0f;
+            static float wheelLoad_rating_kg = 150.0f;
+            static float bearingLoad_rating_N = 2000.0f;
+
+            // Material properties
+            static float chassisMaterial_density_kgm3 = 2700.0f; // Aluminum
+            static float chassisThickness_mm = 3.0f;
+            static float safetyFactor = 2.5f;
+
+            static float simTime_s = 0.0f;
+            static std::deque<ImVec2> sTorqueFront, sTorqueRear, sNf, sNr;
+
+            auto clampf = [](float v, float lo, float hi)
+            { return v < lo ? lo : (v > hi ? hi : v); };
+            float dt = ImGui::GetIO().DeltaTime;
+            simTime_s += dt;
+
+            // Compute loads and torques (convert mm -> m for physics)
+            const float g = 9.80665f;
+            float mass = inputs.payloadKg + 20.0f;
+            float theta = inputs.slope_deg * 3.1415926535f / 180.0f;
+            float wheelbase_m = wheelbase_mm * 0.001f;
+            float cgFromRear_m = cgFromRear_mm * 0.001f;
+            float cgHeight_m = cgHeight_mm * 0.001f;
+            float wheelRadius_m = wheelRadius_mm * 0.001f;
+            float W = mass * g;
+            float Nf = (W * (cgFromRear_m * std::cos(theta) - cgHeight_m * std::sin(theta))) / std::max(0.001f, wheelbase_m);
+            float Nr = W * std::cos(theta) - Nf;
+            if (Nf < 0.0f)
+                Nf = 0.0f;
+            if (Nr < 0.0f)
+                Nr = 0.0f;
+
+            // Gravity component along +X (right). Positive theta means slope rises to the right,
+            // so gravity acts downslope to the left (negative X): -W*sin(theta)
+            float F_grav = -W * std::sin(theta);
+            float F_rr = c_rr * W * std::cos(theta);
+            // Aerodynamic drag for control (commanded) vs dynamics (instantaneous)
+            float speedUsed_mps = motorEnabled ? inputs.speed_mps : actualSpeed_mps;
+            float F_aero_cmd = 0.5f * rho_air * CdA * inputs.speed_mps * std::fabs(inputs.speed_mps);
+            float F_aero_inst = 0.5f * rho_air * CdA * actualSpeed_mps * std::fabs(actualSpeed_mps);
+            // Required drive to maintain commanded speed in its direction
+            float sign_cmd = (inputs.speed_mps >= 0.0f) ? 1.0f : -1.0f;
+            float F_grav_req = W * std::sin(theta) * sign_cmd; // positive when uphill relative to commanded direction
+            float F_rr_mag = c_rr * W * std::cos(theta);
+            float F_drive_req = F_rr_mag + F_aero_cmd + std::max(0.0f, F_grav_req);
+
+            float tractionFrontMax = inputs.mu * Nf;
+            float tractionRearMax = inputs.mu * Nr;
+            // Motor force target = feedforward (to hold cmd speed on slope) + feedback (track speed)
+            float tau_track = 0.6f;
+            float F_feedback = (inputs.speed_mps - actualSpeed_mps) / tau_track * mass;
+            float F_motor_target = motorEnabled ? (F_drive_req + F_feedback) : 0.0f;
+            // Distribute to axles per mode with axle traction limits
+            float F_front = 0.0f, F_rear = 0.0f;
+            if (driveMode == 0) // FWD
+            {
+                F_front = clampf(F_motor_target, -tractionFrontMax, tractionFrontMax);
+                F_rear = 0.0f;
+            }
+            else if (driveMode == 1) // RWD
+            {
+                F_rear = clampf(F_motor_target, -tractionRearMax, tractionRearMax);
+                F_front = 0.0f;
+            }
+            else // AWD (split, then reassign remainder)
+            {
+                float half = 0.5f * F_motor_target;
+                F_front = clampf(half, -tractionFrontMax, tractionFrontMax);
+                F_rear = clampf(half, -tractionRearMax, tractionRearMax);
+                float remF = half - F_front;
+                float remR = half - F_rear;
+                if (remF != 0.0f)
+                    F_rear = clampf(F_rear + remF, -tractionRearMax, tractionRearMax);
+                if (remR != 0.0f)
+                    F_front = clampf(F_front + remR, -tractionFrontMax, tractionFrontMax);
+            }
+            float T_front = F_front * wheelRadius_m;
+            float T_rear = F_rear * wheelRadius_m;
+
+            // Append time series
+            sTorqueFront.emplace_back(simTime_s, T_front);
+            sTorqueRear.emplace_back(simTime_s, T_rear);
+            sNf.emplace_back(simTime_s, Nf);
+            sNr.emplace_back(simTime_s, Nr);
+            auto trim = [](std::deque<ImVec2> &q)
+            { if ((int)q.size() > 1200) q.pop_front(); };
+            trim(sTorqueFront);
+            trim(sTorqueRear);
+            trim(sNf);
+            trim(sNr);
+
+            // Vector physics: track velocity and acceleration components
+            float oldVelX = velocityX_mps;
+            float oldVelY = velocityY_mps;
+
+            if (!motorEnabled)
+            {
+                // Net force acts along slope direction in world coordinates
+                float cos_slope = std::cos(theta);
+                float sin_slope = std::sin(theta);
+                float F_net_world = F_motor_target + F_grav - F_rr - F_aero_inst;
+
+                if (brakesApplied)
+                {
+                    // Maximum braking force available from all wheels
+                    float F_brake_max = inputs.mu * W * std::cos(theta);
+                    float v_mag = std::sqrt(velocityX_mps * velocityX_mps + velocityY_mps * velocityY_mps);
+
+                    if (v_mag > 0.001f)
+                    {
+                        // Apply braking force directly opposite to motion along slope direction
+                        float brake_force_along_slope = F_brake_max;
+                        if (v_mag < 0.1f)
+                            brake_force_along_slope *= 3.0f; // Extra braking at low speeds
+
+                        // Determine if we're moving uphill or downhill and oppose accordingly
+                        float velocity_along_slope = velocityX_mps * cos_slope + velocityY_mps * sin_slope;
+                        if (velocity_along_slope > 0.0f)
+                            F_net_world -= brake_force_along_slope; // Moving upslope, brake downslope
+                        else if (velocity_along_slope < 0.0f)
+                            F_net_world += brake_force_along_slope; // Moving downslope, brake upslope
+
+                        // Direct velocity damping for very effective braking
+                        velocityX_mps *= (1.0f - 10.0f * dt); // Strong velocity damping
+                        velocityY_mps *= (1.0f - 10.0f * dt);
+                    }
+                    else
+                    {
+                        // At very low speeds, lock the wheels completely
+                        velocityX_mps = 0.0f;
+                        velocityY_mps = 0.0f;
+                        accelX_mps2 = 0.0f;
+                        accelY_mps2 = 0.0f;
+                        F_net_world = 0.0f; // No forces when locked
+                    }
+                }
+                float F_x = F_net_world * cos_slope; // force component along +X (right)
+                float F_y = F_net_world * sin_slope; // force component along +Y (up)
+
+                accelX_mps2 = F_x / std::max(1.0f, mass);
+                accelY_mps2 = F_y / std::max(1.0f, mass);
+
+                velocityX_mps += accelX_mps2 * dt;
+                velocityY_mps += accelY_mps2 * dt;
+
+                // Damping for very small velocities
+                if (std::fabs(velocityX_mps) < 0.0005f)
+                    velocityX_mps = 0.0f;
+                if (std::fabs(velocityY_mps) < 0.0005f)
+                    velocityY_mps = 0.0f;
+
+                actualSpeed_mps = std::sqrt(velocityX_mps * velocityX_mps + velocityY_mps * velocityY_mps);
+                speedUsed_mps = actualSpeed_mps;
+            }
+            else
+            {
+                // Motor enforces commanded speed along slope direction
+                float cos_slope = std::cos(theta);
+                float sin_slope = std::sin(theta);
+                velocityX_mps = inputs.speed_mps * cos_slope;
+                velocityY_mps = inputs.speed_mps * sin_slope;
+                actualSpeed_mps = std::fabs(inputs.speed_mps);
+
+                // Calculate acceleration for display
+                accelX_mps2 = (velocityX_mps - oldVelX) / std::max(0.001f, dt);
+                accelY_mps2 = (velocityY_mps - oldVelY) / std::max(0.001f, dt);
+
+                // Brakes can override motor - apply strong braking even when motor is on
+                if (brakesApplied)
+                {
+                    float v_mag = std::sqrt(velocityX_mps * velocityX_mps + velocityY_mps * velocityY_mps);
+                    if (v_mag > 0.001f)
+                    {
+                        // Strong braking dampens velocity directly
+                        velocityX_mps *= (1.0f - 12.0f * dt); // Very strong braking with motor on
+                        velocityY_mps *= (1.0f - 12.0f * dt);
+                        actualSpeed_mps = std::sqrt(velocityX_mps * velocityX_mps + velocityY_mps * velocityY_mps);
+                    }
+                    else
+                    {
+                        // Complete stop
+                        velocityX_mps = 0.0f;
+                        velocityY_mps = 0.0f;
+                        actualSpeed_mps = 0.0f;
+                    }
+                }
+            }
+
+            // Update world position
+            positionX_m += velocityX_mps * dt;
+            positionY_m += velocityY_mps * dt;
+
+            // 2D Free-body Diagram window
+            ImGui::Begin("Diagram 2D");
+            ImDrawList *dl2 = ImGui::GetWindowDrawList();
+            ImVec2 wpos = ImGui::GetWindowPos();
+            ImVec2 cmin = ImGui::GetWindowContentRegionMin();
+            ImVec2 cmax = ImGui::GetWindowContentRegionMax();
+            ImVec2 dmin = ImVec2(wpos.x + cmin.x, wpos.y + cmin.y);
+            ImVec2 dmax = ImVec2(wpos.x + cmax.x, wpos.y + cmax.y);
+            float dw = dmax.x - dmin.x, dh = dmax.y - dmin.y;
+            dl2->AddRectFilled(dmin, dmax, IM_COL32(255, 255, 255, 255)); // White background
+            dl2->AddRect(dmin, dmax, IM_COL32(200, 200, 200, 255), 0.0f, 0, 1.0f);
+
+            // World basis for ground line at slope theta
+            ImVec2 center = ImVec2(dmin.x + dw * 0.5f, dmin.y + dh * 0.65f);
+            float pxPerMM = (dw * 0.7f) / (wheelbase_mm + 500.0f);
+            ImVec2 u = ImVec2(std::cos(theta), -std::sin(theta));
+            ImVec2 v = ImVec2(std::sin(theta), std::cos(theta));
+            auto add = [](ImVec2 a, ImVec2 b)
+            { return ImVec2(a.x + b.x, a.y + b.y); };
+            auto mul = [](ImVec2 a, float s)
+            { return ImVec2(a.x * s, a.y * s); };
+
+            // Ground line and axes
+            ImVec2 g0 = add(center, mul(u, -0.6f * dw));
+            ImVec2 g1 = add(center, mul(u, 0.6f * dw));
+            dl2->AddLine(g0, g1, IM_COL32(60, 60, 60, 255), 3.0f);
+            auto arrow = [&](ImVec2 p, ImVec2 dir, float len_px, ImU32 col)
+            {
+                ImVec2 q = add(p, mul(dir, len_px));
+                dl2->AddLine(p, q, col, 2.0f);
+                ImVec2 ort = ImVec2(-dir.y, dir.x);
+                ImVec2 h1 = add(q, add(mul(dir, -8.0f), mul(ort, 4.0f)));
+                ImVec2 h2 = add(q, add(mul(dir, -8.0f), mul(ort, -4.0f)));
+                dl2->AddTriangleFilled(q, h1, h2, col);
+            };
+            // removed axis arrows
+
+            // Wheel centers (use engineering variables)
+            ImVec2 rearC = add(center, mul(u, -0.5f * wheelbase_mm * pxPerMM));
+            ImVec2 frontC = add(center, mul(u, 0.5f * wheelbase_mm * pxPerMM));
+            float rpx = wheelRadius_mm * pxPerMM;
+            // wheels sit below the ground line
+            rearC = add(rearC, mul(v, -rpx));
+            frontC = add(frontC, mul(v, -rpx));
+
+            // Wheel color based on load status
+            float wheelload_per_wheel_N = (inputs.payloadKg + 20.0f) * 9.81f / 4.0f;
+            bool wheelOverloaded = wheelload_per_wheel_N > (wheelLoad_rating_kg * 9.81f);
+            ImU32 wheelColor = wheelOverloaded ? IM_COL32(200, 40, 40, 255) : IM_COL32(40, 40, 40, 255);
+
+            // Draw wheels with width indication
+            float wheelWidthPx = wheelWidth_mm * pxPerMM * 0.3f; // scaled for visibility
+            dl2->AddCircle(rearC, rpx, wheelColor, 32, 3.0f);
+            dl2->AddCircle(frontC, rpx, wheelColor, 32, 3.0f);
+
+            // Show wheel width as inner circles
+            if (wheelWidthPx > 2.0f)
+            {
+                dl2->AddCircle(rearC, rpx - wheelWidthPx * 0.5f, wheelColor, 32, 1.0f);
+                dl2->AddCircle(frontC, rpx - wheelWidthPx * 0.5f, wheelColor, 32, 1.0f);
+            }
+
+            // Wheel rotation marker (dot only) - based on actual physics
+            static float wheelPhase = 0.0f;
+            // Wheel rotation based on velocity along ground (u direction)
+            float velocity_along_ground = velocityX_mps * std::cos(theta) + velocityY_mps * std::sin(theta);
+            float omegaReal = (wheelRadius_m > 0.0f) ? (velocity_along_ground / wheelRadius_m) : 0.0f;
+            // Positive velocity_along_ground = moving up the slope = clockwise rotation (when viewed from right side)
+            wheelPhase += omegaReal * dt;
+            if (wheelPhase > 6.283185f)
+                wheelPhase -= 6.283185f;
+            if (wheelPhase < -6.283185f)
+                wheelPhase += 6.283185f;
+            auto drawSpoke = [&](ImVec2 c)
+            {
+                float cs = std::cos(wheelPhase), sn = std::sin(wheelPhase);
+                ImVec2 rad = ImVec2(u.x * cs + v.x * sn, u.y * cs + v.y * sn);
+                ImVec2 tip = add(c, mul(rad, rpx * 0.8f));
+                dl2->AddCircleFilled(tip, 3.0f, IM_COL32(20, 20, 20, 255)); // Dark marker, slightly larger
+            };
+            drawSpoke(rearC);
+            drawSpoke(frontC);
+
+            // Chassis box removed per request
+
+            // CG position
+            ImVec2 rearContact = add(rearC, mul(v, rpx));
+            ImVec2 frontContact = add(frontC, mul(v, rpx));
+            ImVec2 cg = add(rearContact, mul(u, cgFromRear_mm * pxPerMM));
+            cg = add(cg, mul(v, -(cgHeight_mm + wheelRadius_mm) * pxPerMM));
+            dl2->AddCircleFilled(cg, 4.0f, IM_COL32(180, 100, 20, 255)); // Dark orange
+
+            // Arrow helper (reused above)
+            // Force scaling: fixed base scale, multiply by magnitude
+            float pixelsPerNewton = (dh > 0.0f ? (dh * 0.00025f) : 0.2f);
+            auto scaleF = [&](float F)
+            { float len = std::fabs(F) * pixelsPerNewton; return (len < 2.0f ? 2.0f : len); };
+            // Normals (up along v)
+            // normals point opposite of ground normal to visualize reaction force
+            arrow(rearContact, ImVec2(-v.x, -v.y), scaleF(Nr), IM_COL32(20, 100, 180, 255));  // Dark blue
+            arrow(frontContact, ImVec2(-v.x, -v.y), scaleF(Nf), IM_COL32(20, 100, 180, 255)); // Dark blue
+            // Weight (down vertical)
+            arrow(cg, ImVec2(0, 1), scaleF(W), IM_COL32(180, 20, 20, 255)); // Dark red
+            // Drive/traction vectors: horizontal screen-space (right=+X), flip by travel direction
+            if (F_rear > 0.0f)
+            {
+                ImVec2 dir = (actualSpeed_mps >= 0.0f) ? ImVec2(-1.0f, 0.0f) : ImVec2(1.0f, 0.0f);
+                arrow(rearContact, dir, scaleF(F_rear), IM_COL32(20, 120, 20, 255)); // Dark green
+            }
+            if (F_front > 0.0f)
+            {
+                ImVec2 dir = (actualSpeed_mps >= 0.0f) ? ImVec2(-1.0f, 0.0f) : ImVec2(1.0f, 0.0f);
+                arrow(frontContact, dir, scaleF(F_front), IM_COL32(20, 120, 20, 255)); // Dark green
+            }
+
+            // Torque arc magnitude and direction at each wheel
+            auto drawTorqueArc = [&](ImVec2 c, float T, bool isBraking = false)
+            {
+                float Tmag = std::fabs(T);
+                if (Tmag < 1e-3f && !isBraking)
+                    return;
+                float radius = rpx * 0.7f;
+                int segs = 28;
+                float span = std::min(2.2f, 0.0035f * Tmag + 0.4f);
+
+                // Torque direction based on actual physics
+                float signRot = (T >= 0.0f ? 1.0f : -1.0f);
+                if (isBraking)
+                    signRot = -signRot; // Brake torque opposes motion
+
+                float start = 0.0f;
+                float end = start + signRot * span;
+                ImU32 col = isBraking ? IM_COL32(180, 20, 20, 255) : IM_COL32(160, 80, 20, 255); // Red for braking, orange for driving
+                ImVec2 prev = ImVec2(c.x + radius * std::cos(start), c.y + radius * std::sin(start));
+                for (int i = 1; i <= segs; ++i)
+                {
+                    float t = start + (end - start) * ((float)i / segs);
+                    ImVec2 cur = ImVec2(c.x + radius * std::cos(t), c.y + radius * std::sin(t));
+                    dl2->AddLine(prev, cur, col, isBraking ? 3.0f : 2.0f);
+                    prev = cur;
+                }
+                ImVec2 dir = ImVec2(std::cos(end), std::sin(end));
+                ImVec2 tip = ImVec2(c.x + radius * dir.x, c.y + radius * dir.y);
+                ImVec2 ort = ImVec2(-dir.y, dir.x);
+                ImVec2 h1 = ImVec2(tip.x + (-8.0f * dir.x + 4.0f * ort.x), tip.y + (-8.0f * dir.y + 4.0f * ort.y));
+                ImVec2 h2 = ImVec2(tip.x + (-8.0f * dir.x - 4.0f * ort.x), tip.y + (-8.0f * dir.y - 4.0f * ort.y));
+                dl2->AddTriangleFilled(tip, h1, h2, col);
+            };
+
+            // Calculate brake torques when brakes are applied
+            float T_brake_rear = 0.0f, T_brake_front = 0.0f;
+            if (brakesApplied)
+            {
+                float F_brake_max = inputs.mu * W * std::cos(theta);
+                T_brake_rear = F_brake_max * 0.5f * wheelRadius_m; // Half brake force per wheel
+                T_brake_front = F_brake_max * 0.5f * wheelRadius_m;
+            }
+
+            // Draw drive torques
+            drawTorqueArc(rearC, T_rear, false);
+            drawTorqueArc(frontC, T_front, false);
+
+            // Draw brake torques (opposing rotation)
+            if (brakesApplied)
+            {
+                drawTorqueArc(rearC, T_brake_rear, true);
+                drawTorqueArc(frontC, T_brake_front, true);
+            }
+
+            // Labels (positioned lower to avoid torque label overlap)
+            char buf[128];
+            snprintf(buf, sizeof(buf), "Rear load: %.0f N", Nr);
+            dl2->AddText(add(rearContact, mul(v, rpx + 35.0f)), IM_COL32(20, 20, 20, 255), buf); // Dark text, positioned lower
+            snprintf(buf, sizeof(buf), "Front load: %.0f N", Nf);
+            dl2->AddText(add(frontContact, mul(v, rpx + 35.0f)), IM_COL32(20, 20, 20, 255), buf); // Dark text, positioned lower
+            snprintf(buf, sizeof(buf), "Weight: %.0f N", W);
+            dl2->AddText(add(cg, ImVec2(6, 6)), IM_COL32(20, 20, 20, 255), buf); // Dark text
+            snprintf(buf, sizeof(buf), "Drive force needed: %.0f N (Gravity %.0f N, Rolling resistance %.0f N, Air drag %.0f N)", F_drive_req, F_grav_req, F_rr_mag, F_aero_cmd);
+            dl2->AddText(ImVec2(dmin.x + 8.0f, dmin.y + 8.0f), IM_COL32(20, 20, 20, 255), buf); // Dark text
+            snprintf(buf, sizeof(buf), "Front torque: %.1f Nm  Rear torque: %.1f Nm", T_front, T_rear);
+            dl2->AddText(ImVec2(dmin.x + 8.0f, dmin.y + 28.0f), IM_COL32(20, 20, 20, 255), buf); // Dark text
+
+            // Per-wheel torque magnitude labels near wheels
+            {
+                char tbuf[64];
+                if (brakesApplied)
+                {
+                    snprintf(tbuf, sizeof(tbuf), "Td=%.1f Tb=%.1f Nm", std::fabs(T_rear), T_brake_rear);
+                    dl2->AddText(add(rearC, mul(v, rpx + 12.0f)), IM_COL32(20, 20, 20, 255), tbuf); // Dark text
+                    snprintf(tbuf, sizeof(tbuf), "Td=%.1f Tb=%.1f Nm", std::fabs(T_front), T_brake_front);
+                    dl2->AddText(add(frontC, mul(v, rpx + 12.0f)), IM_COL32(20, 20, 20, 255), tbuf); // Dark text
+                }
+                else
+                {
+                    snprintf(tbuf, sizeof(tbuf), "\xcf\x84=%.1f Nm", std::fabs(T_rear));
+                    dl2->AddText(add(rearC, mul(v, rpx + 12.0f)), IM_COL32(160, 80, 20, 255), tbuf); // Dark orange
+                    snprintf(tbuf, sizeof(tbuf), "\xcf\x84=%.1f Nm", std::fabs(T_front));
+                    dl2->AddText(add(frontC, mul(v, rpx + 12.0f)), IM_COL32(160, 80, 20, 255), tbuf); // Dark orange
+                }
+            }
+            ImGui::End();
+
+            // Forces viewport removed
+
+            // Graphs window (time series)
+            ImGui::Begin("Graphs");
+            ImDrawList *dlg = ImGui::GetWindowDrawList();
+            ImVec2 gpos = ImGui::GetWindowPos();
+            ImVec2 gmin = ImVec2(gpos.x + ImGui::GetWindowContentRegionMin().x, gpos.y + ImGui::GetWindowContentRegionMin().y);
+            ImVec2 gmax = ImVec2(gpos.x + ImGui::GetWindowContentRegionMax().x, gpos.y + ImGui::GetWindowContentRegionMax().y);
+            float gw = gmax.x - gmin.x, gh = gmax.y - gmin.y;
+            dlg->AddRectFilled(gmin, gmax, IM_COL32(255, 255, 255, 255)); // White background
+            dlg->AddRect(gmin, gmax, IM_COL32(150, 150, 150, 255));
+            auto plotSeries = [&](const std::deque<ImVec2> &data, ImU32 col, float y0, const char *title)
+            {
+                if (data.size() < 2)
+                    return;
+                float h = (gh - 12.0f) / 3.0f;
+                ImVec2 r0 = ImVec2(gmin.x + 6.0f, gmin.y + 6.0f + y0 * h);
+                ImVec2 r1 = ImVec2(gmax.x - 6.0f, r0.y + h - 6.0f);
+                dlg->AddRect(r0, r1, IM_COL32(120, 120, 120, 255), 0.0f, 0, 1.0f);
+                float xmin = data.front().x, xmax = data.back().x;
+                float ymin = data.front().y, ymax = data.front().y;
+                for (const auto &p : data)
+                {
+                    if (p.y < ymin)
+                        ymin = p.y;
+                    if (p.y > ymax)
+                        ymax = p.y;
+                }
+                if (xmax <= xmin)
+                    xmax = xmin + 1.0f;
+                if (ymax <= ymin)
+                    ymax = ymin + 1.0f;
+                auto toScr = [&](float x, float y)
+                {
+                    float u = (x - xmin) / (xmax - xmin);
+                    float v = (y - ymin) / (ymax - ymin);
+                    return ImVec2(r0.x + u * (r1.x - r0.x), r0.y + (1.0f - v) * (r1.y - r0.y));
+                };
+                for (size_t i = 1; i < data.size(); ++i)
+                    dlg->AddLine(toScr(data[i - 1].x, data[i - 1].y), toScr(data[i].x, data[i].y), col, 2.0f);
+                dlg->AddText(ImVec2(r0.x + 4, r0.y + 4), IM_COL32(20, 20, 20, 255), title); // Dark text
+                // axes labels removed per request
+            };
+            plotSeries(sTorqueFront, IM_COL32(180, 80, 20, 255), 0.0f, "Front Torque (Nm)");      // Dark orange
+            plotSeries(sTorqueRear, IM_COL32(20, 120, 20, 255), 1.0f, "Rear Torque (Nm)");        // Dark green
+            plotSeries(sNf, IM_COL32(20, 100, 180, 255), 2.0f, "Normal Forces (N) [front=blue]"); // Dark blue
+            // Overlay rear normals in green on same third
+            if (sNr.size() > 1)
+            {
+                // reuse last plot rect by computing it again
+                float h = (gh - 12.0f) / 3.0f;
+                ImVec2 r0 = ImVec2(gmin.x + 6.0f, gmin.y + 6.0f + 2.0f * h);
+                ImVec2 r1 = ImVec2(gmax.x - 6.0f, r0.y + h - 6.0f);
+                float xmin = sNf.front().x, xmax = sNf.back().x;
+                float ymin = sNf.front().y, ymax = sNf.front().y;
+                for (const auto &p : sNf)
+                {
+                    if (p.y < ymin)
+                        ymin = p.y;
+                    if (p.y > ymax)
+                        ymax = p.y;
+                }
+                for (const auto &p : sNr)
+                {
+                    if (p.y < ymin)
+                        ymin = p.y;
+                    if (p.y > ymax)
+                        ymax = p.y;
+                }
+                if (xmax <= xmin)
+                    xmax = xmin + 1.0f;
+                if (ymax <= ymin)
+                    ymax = ymin + 1.0f;
+                auto toScr = [&](float x, float y)
+                {
+                    float u = (x - xmin) / (xmax - xmin);
+                    float v = (y - ymin) / (ymax - ymin);
+                    return ImVec2(r0.x + u * (r1.x - r0.x), r0.y + (1.0f - v) * (r1.y - r0.y));
+                };
+                for (size_t i = 1; i < sNr.size(); ++i)
+                    dlg->AddLine(toScr(sNr[i - 1].x, sNr[i - 1].y), toScr(sNr[i].x, sNr[i].y), IM_COL32(20, 120, 20, 255), 2.0f); // Dark green
+            }
+            ImGui::End();
+
+            // Controls window
+            ImGui::Begin("Controls");
+            ImGui::TextUnformatted("Inputs");
+            ImGui::Checkbox("Motor enabled", &motorEnabled);
+            ImGui::SameLine();
+            ImGui::Checkbox("Apply brakes (B)", &brakesApplied);
+
+            // Keyboard shortcut for brakes
+            if (ImGui::IsKeyPressed(ImGuiKey_B))
+                brakesApplied = !brakesApplied;
+            ImGui::SliderFloat("Command speed (m/s)", &inputs.speed_mps, -1.5f, 1.5f, "%.2f");
+            ImGui::Text("Actual speed: %.3f m/s", actualSpeed_mps);
+            ImGui::Separator();
+            ImGui::TextUnformatted("Vector State");
+            ImGui::Text("Velocity: (%.3f, %.3f) m/s  |v|=%.3f", velocityX_mps, velocityY_mps,
+                        std::sqrt(velocityX_mps * velocityX_mps + velocityY_mps * velocityY_mps));
+            ImGui::Text("Acceleration: (%.2f, %.2f) m/s²  |a|=%.2f", accelX_mps2, accelY_mps2,
+                        std::sqrt(accelX_mps2 * accelX_mps2 + accelY_mps2 * accelY_mps2));
+            ImGui::Text("Position: (%.2f, %.2f) m", positionX_m, positionY_m);
+            ImGui::SliderFloat("Payload (kg)", &inputs.payloadKg, 0.0f, 210.0f, "%.0f");
+            ImGui::SliderFloat("Slope (deg)", &inputs.slope_deg, -10.0f, 10.0f, "%.1f");
+            ImGui::SliderFloat("Friction mu", &inputs.mu, 0.2f, 0.8f, "%.2f");
+            ImGui::Separator();
+            ImGui::TextUnformatted("Geometry");
+            ImGui::SliderFloat("Wheelbase (mm)", &wheelbase_mm, 200.0f, 2000.0f, "%.0f");
+            ImGui::SliderFloat("CG from rear (mm)", &cgFromRear_mm, 10.0f, wheelbase_mm - 10.0f, "%.0f");
+            ImGui::SliderFloat("CG height (mm)", &cgHeight_mm, 50.0f, 900.0f, "%.0f");
+            ImGui::SliderFloat("Wheel radius (mm)", &wheelRadius_mm, 40.0f, 300.0f, "%.0f");
+            ImGui::Separator();
+            ImGui::TextUnformatted("Losses");
+            ImGui::SliderFloat("Rolling resistance coeff (c_rr)", &c_rr, 0.005f, 0.04f, "%.3f");
+            ImGui::SliderFloat("Drag area (CdA)", &CdA, 0.2f, 1.2f, "%.2f");
+            ImGui::SliderFloat("Air density (kg/m^3)", &rho_air, 0.9f, 1.4f, "%.2f");
+            ImGui::Separator();
+            ImGui::TextUnformatted("Drive Mode");
+            const char *modes[] = {"FWD", "RWD", "AWD"};
+            ImGui::Combo("##drive", &driveMode, modes, 3);
+            ImGui::Separator();
+
+            // Motor Design Section
+            ImGui::TextUnformatted("Motor & Drivetrain");
+            ImGui::SliderFloat("Motor Power (W)", &motorPower_W, 100.0f, 1000.0f, "%.0f");
+            ImGui::SliderFloat("Max Torque (Nm)", &motorMaxTorque_Nm, 5.0f, 50.0f, "%.1f");
+            ImGui::SliderFloat("Max RPM", &motorMaxRPM, 1000.0f, 6000.0f, "%.0f");
+            ImGui::SliderFloat("Motor Efficiency", &motorEfficiency, 0.70f, 0.95f, "%.2f");
+            ImGui::SliderFloat("Gear Reduction", &gearReduction, 1.0f, 20.0f, "%.1f");
+            ImGui::SliderFloat("Chain Efficiency", &chainEfficiency, 0.85f, 0.98f, "%.2f");
+
+            ImGui::Separator();
+
+            // Axle Design Section
+            ImGui::TextUnformatted("Axle & Bearings");
+            ImGui::SliderFloat("Axle Diameter (mm)", &axleDiameter_mm, 15.0f, 40.0f, "%.1f");
+            ImGui::SliderFloat("Material Strength (MPa)", &axleMaterial_tensileStrength_MPa, 200.0f, 800.0f, "%.0f");
+            ImGui::SliderFloat("Bearing Rating (N)", &bearingLoad_rating_N, 1000.0f, 5000.0f, "%.0f");
+
+            ImGui::Separator();
+
+            // Wheel Design Section
+            ImGui::TextUnformatted("Wheel Design");
+            ImGui::SliderFloat("Wheel Width (mm)", &wheelWidth_mm, 30.0f, 100.0f, "%.0f");
+            ImGui::SliderFloat("Wheel Load Rating (kg)", &wheelLoad_rating_kg, 100.0f, 300.0f, "%.0f");
+
+            ImGui::Separator();
+
+            // Trolley Dimensions Section
+            ImGui::TextUnformatted("Trolley Dimensions");
+            ImGui::SliderFloat("Width (mm)", &trolleyWidth_mm, 400.0f, 1000.0f, "%.0f");
+            ImGui::SliderFloat("Height (mm)", &trolleyHeight_mm, 600.0f, 1200.0f, "%.0f");
+            ImGui::SliderFloat("Deck Height (mm)", &deckHeight_mm, 100.0f, 400.0f, "%.0f");
+            ImGui::SliderFloat("Ground Clearance (mm)", &groundClearance_mm, 20.0f, 100.0f, "%.0f");
+
+            ImGui::Separator();
+
+            // Material & Safety Section
+            ImGui::TextUnformatted("Materials & Safety");
+            ImGui::SliderFloat("Chassis Density (kg/m³)", &chassisMaterial_density_kgm3, 2000.0f, 8000.0f, "%.0f");
+            ImGui::SliderFloat("Thickness (mm)", &chassisThickness_mm, 1.5f, 8.0f, "%.1f");
+            ImGui::SliderFloat("Safety Factor", &safetyFactor, 1.5f, 4.0f, "%.1f");
+
+            ImGui::Separator();
+
+            // Battery inputs kept for future runtime estimation; not used in dynamics
+            if (ImGui::Button("Export CSV"))
+            { /* TODO: export series */
+            }
+            ImGui::End();
+
+            // Minimap window
+            ImGui::Begin("Minimap");
+            {
+                ImDrawList *dlMap = ImGui::GetWindowDrawList();
+                ImVec2 mapPos = ImGui::GetWindowPos();
+                ImVec2 mapMin = ImVec2(mapPos.x + ImGui::GetWindowContentRegionMin().x, mapPos.y + ImGui::GetWindowContentRegionMin().y);
+                ImVec2 mapMax = ImVec2(mapPos.x + ImGui::GetWindowContentRegionMax().x, mapPos.y + ImGui::GetWindowContentRegionMax().y);
+                float mapW = mapMax.x - mapMin.x, mapH = mapMax.y - mapMin.y;
+
+                // White background
+                dlMap->AddRectFilled(mapMin, mapMax, IM_COL32(255, 255, 255, 255));
+                dlMap->AddRect(mapMin, mapMax, IM_COL32(100, 100, 100, 255), 0.0f, 0, 2.0f);
+
+                // Calculate map scale and center
+                float mapRange = 50.0f; // show ±50m range
+                float scaleX = (mapW - 20.0f) / (2.0f * mapRange);
+                float scaleY = (mapH - 20.0f) / (2.0f * mapRange);
+                float scale = std::min(scaleX, scaleY);
+                ImVec2 mapCenter = ImVec2(mapMin.x + mapW * 0.5f, mapMin.y + mapH * 0.5f);
+
+                // Draw grid
+                for (int i = -5; i <= 5; ++i)
+                {
+                    float gridStep = 10.0f; // 10m grid
+                    float x = mapCenter.x + i * gridStep * scale;
+                    float y = mapCenter.y + i * gridStep * scale;
+                    ImU32 gridCol = (i == 0) ? IM_COL32(100, 100, 100, 180) : IM_COL32(180, 180, 180, 120);
+                    if (x >= mapMin.x && x <= mapMax.x)
+                        dlMap->AddLine(ImVec2(x, mapMin.y + 10), ImVec2(x, mapMax.y - 10), gridCol, (i == 0) ? 2.0f : 1.0f);
+                    if (y >= mapMin.y && y <= mapMax.y)
+                        dlMap->AddLine(ImVec2(mapMin.x + 10, y), ImVec2(mapMax.x - 10, y), gridCol, (i == 0) ? 2.0f : 1.0f);
+                }
+
+                // Draw trolley position
+                ImVec2 trolleyMap = ImVec2(mapCenter.x + positionX_m * scale, mapCenter.y - positionY_m * scale);
+                dlMap->AddCircleFilled(trolleyMap, 4.0f, IM_COL32(180, 20, 20, 255)); // Dark red
+
+                // Draw velocity vector
+                if (std::sqrt(velocityX_mps * velocityX_mps + velocityY_mps * velocityY_mps) > 0.1f)
+                {
+                    float velScale = 20.0f; // scale for velocity visualization
+                    ImVec2 velEnd = ImVec2(trolleyMap.x + velocityX_mps * velScale, trolleyMap.y - velocityY_mps * velScale);
+                    dlMap->AddLine(trolleyMap, velEnd, IM_COL32(20, 80, 180, 255), 3.0f); // Dark blue
+                    // Arrow head
+                    ImVec2 dir = ImVec2(velEnd.x - trolleyMap.x, velEnd.y - trolleyMap.y);
+                    float len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
+                    if (len > 5.0f)
+                    {
+                        dir.x /= len;
+                        dir.y /= len;
+                        ImVec2 ort = ImVec2(-dir.y, dir.x);
+                        ImVec2 h1 = ImVec2(velEnd.x - 6 * dir.x + 3 * ort.x, velEnd.y - 6 * dir.y + 3 * ort.y);
+                        ImVec2 h2 = ImVec2(velEnd.x - 6 * dir.x - 3 * ort.x, velEnd.y - 6 * dir.y - 3 * ort.y);
+                        dlMap->AddTriangleFilled(velEnd, h1, h2, IM_COL32(20, 80, 180, 255)); // Dark blue
+                    }
+                }
+
+                // Labels
+                dlMap->AddText(ImVec2(mapMin.x + 5, mapMin.y + 5), IM_COL32(20, 20, 20, 255), "Minimap"); // Dark text
+                char posBuf[64];
+                snprintf(posBuf, sizeof(posBuf), "X:%.1fm Y:%.1fm", positionX_m, positionY_m);
+                dlMap->AddText(ImVec2(mapMin.x + 5, mapMax.y - 20), IM_COL32(20, 20, 20, 255), posBuf); // Dark text
+            }
+            ImGui::End();
+
+            // Design Calculations window
+            ImGui::Begin("Design Calculations");
+            {
+                // Calculate useful engineering metrics
+                float wheelload_per_wheel_N = (inputs.payloadKg + 20.0f) * 9.81f / 4.0f;
+                float axle_stress_MPa = (wheelload_per_wheel_N * wheelbase_mm * 0.001f * 0.25f) / (3.14159f * std::pow(axleDiameter_mm * 0.001f, 3.0f) / 32.0f) / 1e6f;
+                float motor_torque_available_Nm = motorMaxTorque_Nm * gearReduction * motorEfficiency * chainEfficiency;
+                float max_tractive_force_N = motor_torque_available_Nm / (wheelRadius_mm * 0.001f);
+                float trolley_volume_m3 = (trolleyWidth_mm * trolleyHeight_mm * wheelbase_mm) * 1e-9f;
+                float estimated_mass_kg = trolley_volume_m3 * chassisMaterial_density_kgm3 * (chassisThickness_mm / 100.0f);
+
+                ImGui::TextUnformatted("Loading Analysis");
+                ImGui::Text("Load per wheel: %.0f N", wheelload_per_wheel_N);
+                ImGui::Text("Wheel rating: %.0f N", wheelLoad_rating_kg * 9.81f);
+                ImGui::Text("Load safety margin: %.1fx", (wheelLoad_rating_kg * 9.81f) / wheelload_per_wheel_N);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Structural Analysis");
+                ImGui::Text("Axle stress: %.1f MPa", axle_stress_MPa);
+                ImGui::Text("Material limit: %.0f MPa", axleMaterial_tensileStrength_MPa / safetyFactor);
+                ImGui::Text("Stress safety margin: %.1fx", (axleMaterial_tensileStrength_MPa / safetyFactor) / axle_stress_MPa);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Power & Performance");
+                ImGui::Text("Available motor torque: %.1f Nm", motor_torque_available_Nm);
+                ImGui::Text("Max traction force: %.0f N", max_tractive_force_N);
+                ImGui::Text("Power @ max speed: %.0f W", max_tractive_force_N * inputs.speed_mps);
+                ImGui::Text("Motor power rating: %.0f W", motorPower_W);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Mass Estimation");
+                ImGui::Text("Estimated chassis mass: %.1f kg", estimated_mass_kg);
+                ImGui::Text("Payload capacity: %.0f kg", inputs.payloadKg);
+                ImGui::Text("Total system mass: %.1f kg", estimated_mass_kg + inputs.payloadKg);
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Design Status");
+
+                // Safety indicators with detailed analysis
+                bool wheelOverload = wheelload_per_wheel_N > (wheelLoad_rating_kg * 9.81f);
+                bool axleOverstress = axle_stress_MPa > (axleMaterial_tensileStrength_MPa / safetyFactor);
+                bool motorUnderpowered = (max_tractive_force_N * inputs.speed_mps) > motorPower_W;
+
+                if (wheelOverload)
+                {
+                    ImGui::TextColored(ImVec4(1, 0, 0, 1), "⚠ WHEEL OVERLOAD");
+                    ImGui::Text("  Reduce payload or increase wheel rating");
+                }
+                if (axleOverstress)
+                {
+                    ImGui::TextColored(ImVec4(1, 0, 0, 1), "⚠ AXLE OVERSTRESS");
+                    ImGui::Text("  Increase axle diameter or use stronger material");
+                }
+                if (motorUnderpowered)
+                {
+                    ImGui::TextColored(ImVec4(1, 0.5, 0, 1), "⚠ MOTOR UNDERPOWERED");
+                    ImGui::Text("  Increase motor power or reduce max speed");
+                }
+                if (!wheelOverload && !axleOverstress && !motorUnderpowered)
+                {
+                    ImGui::TextColored(ImVec4(0, 0.8, 0, 1), "✓ DESIGN OK");
+                    ImGui::Text("  All components within safe operating limits");
+                }
+
+                // Additional engineering insights
+                ImGui::Separator();
+                ImGui::TextUnformatted("Design Recommendations");
+
+                float power_to_weight = motorPower_W / (estimated_mass_kg + inputs.payloadKg);
+                ImGui::Text("Power-to-weight ratio: %.1f W/kg", power_to_weight);
+
+                if (power_to_weight < 3.0f)
+                {
+                    ImGui::TextColored(ImVec4(1, 0.5, 0, 1), "Consider lighter materials or more power");
+                }
+                else if (power_to_weight > 10.0f)
+                {
+                    ImGui::TextColored(ImVec4(0, 0.8, 0, 1), "Excellent power-to-weight ratio");
+                }
+                else
+                {
+                    ImGui::TextColored(ImVec4(0, 0.8, 0, 1), "Good power-to-weight ratio");
+                }
+            }
+            ImGui::End();
+
+            // End main dockspace window and return (skip 3D)
+            ImGui::End();
+            return;
+        }
+
         // Top menubar
         static bool reqStartDrill = false, reqStop = false, reqResetScene = false, reqClearPath = false;
         static bool reqPlanLeft = false, reqPlanRight = false, reqPlanDown = false, reqPlanUp = false;
@@ -100,44 +915,6 @@ namespace Honeycomb
                 ImGui::EndMenu();
             }
 
-            if (ImGui::BeginMenu("Controls"))
-            {
-                if (ImGui::MenuItem("Start Drill"))
-                    reqStartDrill = true;
-                if (ImGui::MenuItem("Stop"))
-                    reqStop = true;
-                ImGui::Separator();
-                if (ImGui::MenuItem("Plan 90° Left"))
-                    reqPlanLeft = true;
-                if (ImGui::MenuItem("Plan 90° Right"))
-                    reqPlanRight = true;
-                if (ImGui::MenuItem("Plan 90° Down"))
-                    reqPlanDown = true;
-                if (ImGui::MenuItem("Plan 90° Up"))
-                    reqPlanUp = true;
-                ImGui::Separator();
-                if (ImGui::MenuItem("Clear Path"))
-                { /* handled later after statics are declared */
-                    reqClearPath = true;
-                }
-                if (ImGui::MenuItem("Reset Scene"))
-                    reqResetScene = true;
-                ImGui::EndMenu();
-            }
-
-            if (ImGui::BeginMenu("Peristalsis"))
-            {
-                if (ImGui::MenuItem("RESET → IDLE"))
-                    reqPeriReset = true;
-                if (ImGui::MenuItem("JAM"))
-                    reqPeriJam = true;
-                if (ImGui::MenuItem("EMERGENCY STOP"))
-                    reqPeriEStop = true;
-                if (ImGui::MenuItem("Toggle Auto-Cycle"))
-                    reqPeriAutoToggle = true;
-                ImGui::EndMenu();
-            }
-
             ImGui::EndMenuBar();
         }
 
@@ -169,6 +946,14 @@ namespace Honeycomb
 
         // Static scene and camera state across frames
         static auto scene = Engine::SceneBuilder::CreateDefaultScene();
+        static Inputs inputs{};
+        static Outputs outputs{};
+        static std::deque<ImVec2> sTorqueTime;
+        static std::deque<ImVec2> sSpeedDist;
+        static std::deque<ImVec2> sThermalMotor;
+        static float simTime_s = 0.0f;
+        static float simDist_m = 0.0f;
+        static float thermalMotor_C = 0.0f;
         struct SpawnedAtom
         {
             int atomIndex;
@@ -472,6 +1257,25 @@ namespace Honeycomb
         pitch = smoothTowards(pitch, pitch_t, dt, tau_orbit);
         cameraDistance = smoothTowards(cameraDistance, cameraDistance_t, dt, tau_zoom);
 
+        // Recompute dashboard outputs and series
+        outputs.wheelTorque_Nm = Sim::ComputeWheelTorquePerWheel(inputs.payloadKg, inputs.speed_mps, inputs.slope_deg, inputs.mu, 4);
+        outputs.stoppingDistance_m = Sim::ComputeStoppingDistance(inputs.speed_mps, inputs.mu, inputs.slope_deg);
+        float powerW = outputs.wheelTorque_Nm * 4.0f * (inputs.speed_mps / 0.15f);
+        float currentA = powerW / std::max(1.0f, inputs.battVoltage_V * 0.85f);
+        outputs.runtime_hours = Sim::EstimateRuntimeHours(inputs.battCapacity_Ah, inputs.battVoltage_V, inputs.dischargeC, currentA);
+        simTime_s += dt;
+        simDist_m += inputs.speed_mps * dt;
+        sTorqueTime.emplace_back(simTime_s, outputs.wheelTorque_Nm);
+        sSpeedDist.emplace_back(simDist_m, inputs.speed_mps);
+        thermalMotor_C += powerW * 0.0005f * dt; // placeholder thermal model
+        sThermalMotor.emplace_back(simTime_s, 25.0f + thermalMotor_C);
+        if ((int)sTorqueTime.size() > 1024)
+            sTorqueTime.pop_front();
+        if ((int)sSpeedDist.size() > 1024)
+            sSpeedDist.pop_front();
+        if ((int)sThermalMotor.size() > 1024)
+            sThermalMotor.pop_front();
+
         // Keyboard input: locomotion and steering
         if (active)
         {
@@ -592,15 +1396,38 @@ namespace Honeycomb
             }
         }
 
-        // Cutter head animation (spin only when spinning flag true and RPM>0)
-        if (!scene.renderables.empty())
+        // Trolley kinematics: move chassis forward along +Z and spin wheels based on speed & mu
+        if (scene.renderables.size() >= 6)
         {
-            float omega_rad_per_s = (spinning && ui_rpm > 0.0f) ? (ui_rpm * 0.10471975512f) : 0.0f;
-            cutter_phase += omega_rad_per_s * dt;
-            if (cutter_phase > 1000.0f)
-                cutter_phase -= 1000.0f;
-            // roll only here; full orientation set after steering update below
-            scene.renderables[0].transform.rotationEulerRad.z = cutter_phase;
+            // 0 ground, 1 chassis, 2..5 wheels
+            auto &chassis = scene.renderables[1];
+            float slope = inputs.slope_deg * 3.1415926535f / 180.0f;
+            auto clampf2 = [&](float x, float a, float b)
+            { return x < a ? a : (x > b ? b : x); };
+            float v = inputs.speed_mps * (0.2f + 0.8f * clampf2(inputs.mu, 0.0f, 1.0f));
+            v += -std::sin(slope) * 0.4f;
+            if (v < 0.0f)
+                v = 0.0f;
+            if (v > 2.0f)
+                v = 2.0f;
+            chassis.transform.position.z += v * dt;
+            camTarget = {chassis.transform.position.x, chassis.transform.position.y + 0.2f, chassis.transform.position.z + 1.2f};
+
+            float r = 0.15f;
+            float omega = v / std::max(0.05f, r);
+            static float wphase = 0.0f;
+            wphase += omega * dt;
+            if (wphase > 1000.0f)
+                wphase -= 1000.0f;
+            for (int wi = 2; wi <= 5; ++wi)
+            {
+                auto &w = scene.renderables[wi];
+                // Spin around X; wheel mesh pre-rotated around Y by 90deg in builder
+                w.transform.rotationEulerRad = {wphase, 1.57079632679f, 0.0f};
+                float localX = (wi % 2 == 0) ? -0.35f : 0.35f;
+                float localZ = (wi <= 3) ? 0.55f : -0.55f;
+                w.transform.position = {localX, 0.0f, chassis.transform.position.z + localZ};
+            }
         }
 
         // Update camera transform from yaw/pitch and distance
@@ -1208,14 +2035,11 @@ namespace Honeycomb
             }
         }
 
-        // Minimal overlay (telemetry + planned segments when autopilot plan exists)
+        // Minimal overlay (telemetry)
         {
             ImVec2 panel_min = ImVec2(vp_min.x + 8.0f, vp_min.y + 8.0f);
             float line_h = ImGui::GetFontSize() + 2.0f;
-            int upcoming = 0;
-            if (apIndex >= 0 && apIndex < (int)apPlan.size())
-                upcoming = std::min(6, (int)apPlan.size() - apIndex);
-            int num_lines = 4 + (upcoming > 0 ? (1 + upcoming) : 0);
+            int num_lines = 4;
             ImVec2 panel_max = ImVec2(panel_min.x + 360.0f, panel_min.y + line_h * num_lines + 8.0f);
             dl->AddRectFilled(panel_min, panel_max, IM_COL32(0, 0, 0, 110), 4.0f);
             dl->AddRect(panel_min, panel_max, IM_COL32(255, 255, 255, 24), 4.0f, 0, 1.0f);
@@ -1223,46 +2047,20 @@ namespace Honeycomb
             char buf[128];
             dl->AddText(tp, IM_COL32(255, 255, 255, 230), "Telemetry");
             tp.y += line_h;
-            float mps = (spinning && ui_rpm > 0.0f) ? ((ui_rpm / 60.0f) * forward_gain_m_per_rev) : 0.0f;
-            snprintf(buf, sizeof(buf), "RPM: %.1f  Speed: %.3f m/s", ui_rpm, mps);
+            snprintf(buf, sizeof(buf), "Speed: %.2f m/s  Mu: %.2f", inputs.speed_mps, inputs.mu);
             dl->AddText(tp, IM_COL32(225, 225, 235, 220), buf);
             tp.y += line_h;
-            snprintf(buf, sizeof(buf), "Yaw: %.1f deg  Pitch: %.1f deg", sj_yaw_deg, sj_pitch_deg);
+            snprintf(buf, sizeof(buf), "Torque/whl: %.1f Nm  StopDist: %.2f m", outputs.wheelTorque_Nm, outputs.stoppingDistance_m);
             dl->AddText(tp, IM_COL32(225, 225, 235, 220), buf);
             tp.y += line_h;
-            snprintf(buf, sizeof(buf), "Peristalsis: %s%s", periStateName(peristalsisState), peristalsisAuto ? " (AUTO)" : "");
-            dl->AddText(tp, periColor(peristalsisState), buf);
-            tp.y += line_h;
-            if (upcoming > 0)
-            {
-                dl->AddText(tp, IM_COL32(200, 230, 255, 230), "Plan (next):");
-                tp.y += line_h;
-                for (int k = 0; k < upcoming; ++k)
-                {
-                    const auto &seg = apPlan[apIndex + k];
-                    if (seg.kind == SegStraight)
-                    {
-                        float len = seg.length_m;
-                        if (k == 0)
-                            len = std::max(0.0f, seg.length_m - apSegProgress_m);
-                        snprintf(buf, sizeof(buf), "  %sStraight %.2fm", (k == 0 ? "> " : ""), len);
-                        dl->AddText(tp, IM_COL32(180, 255, 180, 230), buf);
-                    }
-                    else
-                    {
-                        const char *axis = seg.pitchAxis ? "Pitch" : "Yaw";
-                        snprintf(buf, sizeof(buf), "  %sTurn %s %+0.0fdeg", (k == 0 ? "> " : ""), axis, seg.targetAbsDeg);
-                        dl->AddText(tp, seg.pitchAxis ? IM_COL32(240, 180, 255, 230) : IM_COL32(180, 220, 255, 230), buf);
-                    }
-                    tp.y += line_h;
-                }
-            }
+            snprintf(buf, sizeof(buf), "Runtime est: %.2f h", outputs.runtime_hours);
+            dl->AddText(tp, IM_COL32(200, 255, 200, 230), buf);
         }
 
         ImGui::End();
 
-        // Mesh Grid Viewport
-        ImGui::Begin("Mesh Grid Viewport");
+        // Graphs Viewport
+        ImGui::Begin("Graphs");
         ImDrawList *dlGrid = ImGui::GetWindowDrawList();
         ImVec2 win_pos2 = ImGui::GetWindowPos();
         ImVec2 content_min2 = ImGui::GetWindowContentRegionMin();
@@ -1552,384 +2350,39 @@ namespace Honeycomb
                 }
             }
 
-            // Overlay (top-left): live signed depth and lateral distances relative to zero origin
-            if (!scene.renderables.empty())
-            {
-                const Engine::Math::Vec3 hp = scene.renderables[0].transform.position;
-                Engine::Math::Vec3 rel{hp.x - gridZero.x, hp.y - gridZero.y, hp.z - gridZero.z};
-                float depth_m = -rel.y; // positive down, negative above origin
-                float lateral_x_m = rel.x;
-                float lateral_z_m = rel.z;
-                float lateral_r_m = std::sqrt(lateral_x_m * lateral_x_m + lateral_z_m * lateral_z_m);
+            // Remove depth/lateral overlay; will plot charts below
 
-                ImVec2 tpos = ImVec2(gv_min.x + 8.0f, gv_min.y + 8.0f);
-                float lh = ImGui::GetFontSize() + 4.0f;
-                char buf[256];
-                snprintf(buf, sizeof(buf), "Depth: %.3f m", depth_m);
-                dlGrid->AddText(ImGui::GetFont(), ImGui::GetFontSize(), tpos, IM_COL32(255, 255, 255, 230), buf);
-                tpos.y += lh;
-                snprintf(buf, sizeof(buf), "Lateral X: %.3f m  Z: %.3f m  |R|: %.3f m", lateral_x_m, lateral_z_m, lateral_r_m);
-                dlGrid->AddText(ImGui::GetFont(), ImGui::GetFontSize(), tpos, IM_COL32(230, 230, 240, 220), buf);
-            }
+            // Remove cutter head outline; graphs shown below
 
-            // Draw cutter head as a true-size capsule outline (radius & length) aligned to head axis
-            if (!scene.renderables.empty())
-            {
-                const Engine::Math::Vec3 hp = scene.renderables[0].transform.position;
-                const float r = ui_radius_m;
-                const float L = ui_length_m;
-                // Head forward axis from current pitch/yaw
-                float pr = sj_pitch_cur_deg * 3.1415926535f / 180.0f;
-                float yr = sj_yaw_cur_deg * 3.1415926535f / 180.0f;
-                float cp = std::cos(pr), sp = std::sin(pr);
-                float cyh = std::cos(yr), syh = std::sin(yr);
-                Engine::Math::Vec3 fwd{syh * cp, -sp, cyh * cp};
-                // Build orthonormal basis (u,v) perpendicular to fwd
-                Engine::Math::Vec3 ref{0.0f, 1.0f, 0.0f};
-                // If nearly parallel to up, use X axis
-                float dot_up = fwd.x * ref.x + fwd.y * ref.y + fwd.z * ref.z;
-                if (std::fabs(dot_up) > 0.95f)
-                    ref = Engine::Math::Vec3{1.0f, 0.0f, 0.0f};
-                // u = normalize(cross(ref, fwd)); v = cross(fwd, u)
-                auto cross = [](const Engine::Math::Vec3 &a, const Engine::Math::Vec3 &b)
-                { return Engine::Math::Vec3{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; };
-                auto norm = [&](const Engine::Math::Vec3 &v)
-                { float l=std::sqrt(v.x*v.x+v.y*v.y+v.z*v.z); return (l>1e-6f)? Engine::Math::Vec3{v.x/l,v.y/l,v.z/l} : Engine::Math::Vec3{1,0,0}; };
-                Engine::Math::Vec3 u = norm(cross(ref, fwd));
-                Engine::Math::Vec3 v = cross(fwd, u);
+            // Remove head path trace; plots used instead
 
-                Engine::Math::Vec3 cFront{hp.x + fwd.x * (0.5f * L), hp.y + fwd.y * (0.5f * L), hp.z + fwd.z * (0.5f * L)};
-                Engine::Math::Vec3 cBack{hp.x - fwd.x * (0.5f * L), hp.y - fwd.y * (0.5f * L), hp.z - fwd.z * (0.5f * L)};
-                const int segs = 32;
-
-                ImVec2 front[33];
-                ImVec2 back[33];
-                int nf = 0, nb = 0;
-                for (int i = 0; i <= segs; ++i)
-                {
-                    float a = (2.0f * 3.1415926535f) * (float)i / (float)segs;
-                    float ca = std::cos(a), sa = std::sin(a);
-                    Engine::Math::Vec3 ringOffF{u.x * (r * ca) + v.x * (r * sa), u.y * (r * ca) + v.y * (r * sa), u.z * (r * ca) + v.z * (r * sa)};
-                    Engine::Math::Vec3 pf{cFront.x + ringOffF.x, cFront.y + ringOffF.y, cFront.z + ringOffF.z};
-                    Engine::Math::Vec3 pb{cBack.x + ringOffF.x, cBack.y + ringOffF.y, cBack.z + ringOffF.z};
-                    ImVec2 sp;
-                    if (projectSafe(pf, sp) && nf < 33)
-                        front[nf++] = sp;
-                    if (projectSafe(pb, sp) && nb < 33)
-                        back[nb++] = sp;
-                }
-                if (nf >= 3)
-                    dlGrid->AddPolyline(front, nf, IM_COL32(255, 80, 80, 220), ImDrawFlags_Closed, 1.6f);
-                if (nb >= 3)
-                    dlGrid->AddPolyline(back, nb, IM_COL32(255, 80, 80, 160), ImDrawFlags_Closed, 1.2f);
-
-                const int picks[4] = {0, segs / 4, segs / 2, 3 * segs / 4};
-                for (int k = 0; k < 4; ++k)
-                {
-                    int i = picks[k];
-                    float a = (2.0f * 3.1415926535f) * (float)i / (float)segs;
-                    float ca = std::cos(a), sa = std::sin(a);
-                    Engine::Math::Vec3 ringOffF{u.x * (r * ca) + v.x * (r * sa), u.y * (r * ca) + v.y * (r * sa), u.z * (r * ca) + v.z * (r * sa)};
-                    Engine::Math::Vec3 pf{cFront.x + ringOffF.x, cFront.y + ringOffF.y, cFront.z + ringOffF.z};
-                    Engine::Math::Vec3 pb{cBack.x + ringOffF.x, cBack.y + ringOffF.y, cBack.z + ringOffF.z};
-                    ImVec2 spf, spb;
-                    if (projectSafe(pf, spf) && projectSafe(pb, spb))
-                        dlGrid->AddLine(spf, spb, IM_COL32(255, 80, 80, 180), 1.2f);
-                }
-            }
-
-            // Draw path trace (polyline) of cutter head in grid view
-            if (!headPath.empty())
-            {
-                std::vector<ImVec2> seg;
-                seg.reserve(headPath.size());
-                auto flushSeg = [&]()
-                {
-                    if (seg.size() >= 2)
-                        dlGrid->AddPolyline(seg.data(), (int)seg.size(), IM_COL32(255, 120, 60, 160), 0, 2.0f);
-                    seg.clear();
-                };
-                for (const auto &wp : headPath)
-                {
-                    ImVec2 sp;
-                    if (projectSafe(wp, sp))
-                    {
-                        seg.push_back(sp);
-                    }
-                    else
-                    {
-                        flushSeg();
-                    }
-                }
-                flushSeg();
-            }
-
-            // Render stationary obstacle only if within sensor coverage and fog
-            if (obstacleVisible)
-            {
-                bool inSensor = false;
-                if (!scene.renderables.empty())
-                {
-                    const Engine::Math::Vec3 hp = scene.renderables[0].transform.position;
-                    const int lnx = 9, lny = 7, lnz = 9; // match head-centered grid neighborhood
-                    float hx = (lnx - 1) * 0.5f * gridSpacingM;
-                    float hy = (lny - 1) * 0.5f * gridSpacingM;
-                    float hz = (lnz - 1) * 0.5f * gridSpacingM;
-                    if (obstacleCenter.x >= hp.x - hx && obstacleCenter.x <= hp.x + hx &&
-                        obstacleCenter.y >= hp.y - hy && obstacleCenter.y <= hp.y + hy &&
-                        obstacleCenter.z >= hp.z - hz && obstacleCenter.z <= hp.z + hz)
-                        inSensor = true;
-                }
-                float f = fogFactor(obstacleCenter);
-                if (inSensor && f > 0.02f)
-                {
-                    // Dotted blue obstacle: sample points on the sphere and draw per-point with fog alpha
-                    const int rings = 16;
-                    const int slices = 32;
-                    for (int i = 0; i <= rings; ++i)
-                    {
-                        float vlat = (float)i / (float)rings;        // 0..1
-                        float theta = (vlat - 0.5f) * 3.1415926535f; // -pi/2..pi/2
-                        float r = obstacleRadius_m * std::cos(theta);
-                        float y = obstacleCenter.y + obstacleRadius_m * std::sin(theta);
-                        for (int j = 0; j < slices; ++j)
-                        {
-                            float u = (2.0f * 3.1415926535f) * (float)j / (float)slices;
-                            Engine::Math::Vec3 p{obstacleCenter.x + r * std::cos(u), y, obstacleCenter.z + r * std::sin(u)};
-                            float fp = fogFactor(p);
-                            if (fp <= 0.02f)
-                                continue;
-                            ImVec2 sp;
-                            if (projectSafe(p, sp))
-                            {
-                                int a = (int)(60 + 195 * fp);
-                                if (a < 0)
-                                    a = 0;
-                                if (a > 255)
-                                    a = 255;
-                                dlGrid->AddCircleFilled(sp, 1.6f, IM_COL32(60, 140, 255, a));
-                            }
-                        }
-                    }
-                }
-            }
+            // Remove obstacle rendering for dashboard graphs
         }
         ImGui::End();
 
-        // Controls window (consolidated)
+        // Controls window (dashboard)
         ImGui::Begin("Controls");
-        ImGui::Checkbox("Autopilot", &autopilotActive);
-        ImGui::SameLine();
-        ImGui::TextDisabled("Bend R>=%.2fm", minBendRadius_m);
+        ImGui::TextUnformatted("Inputs");
+        ImGui::SliderFloat("Payload (kg)", &inputs.payloadKg, 0.0f, 210.0f, "%.0f");
+        ImGui::SliderFloat("Speed (m/s)", &inputs.speed_mps, 0.0f, 1.5f, "%.2f");
+        ImGui::SliderFloat("Slope (deg)", &inputs.slope_deg, -10.0f, 10.0f, "%.1f");
+        ImGui::SliderFloat("Friction mu", &inputs.mu, 0.2f, 0.8f, "%.2f");
         ImGui::Separator();
-        ImGui::TextUnformatted("RPM");
-        ImGui::SliderFloat("##RPM", &ui_rpm, 0.0f, 600.0f, "%.1f");
+        ImGui::TextUnformatted("Battery");
+        ImGui::SliderFloat("Capacity (Ah)", &inputs.battCapacity_Ah, 1.0f, 200.0f, "%.0f");
+        ImGui::SliderFloat("Voltage (V)", &inputs.battVoltage_V, 12.0f, 52.0f, "%.0f");
+        ImGui::SliderFloat("Discharge C", &inputs.dischargeC, 0.2f, 3.0f, "%.1f");
         ImGui::Separator();
-        ImGui::TextUnformatted("Peristalsis");
-        ImGui::Checkbox("Auto-Cycle", &peristalsisAuto);
-        ImGui::SameLine();
-        ImGui::Text("State: %s", periStateName(peristalsisState));
-        if (ImGui::Button("RESET → IDLE"))
-            periHandleEvent(PeriEvent::RESET);
-        ImGui::SameLine();
-        if (ImGui::Button("JAM"))
-            periHandleEvent(PeriEvent::JAM);
-        ImGui::SameLine();
-        if (ImGui::Button("EMERGENCY STOP"))
-            periHandleEvent(PeriEvent::EMERGENCY_STOP);
-        if (ImGui::Button("FRONT LOCKED"))
-            periHandleEvent(PeriEvent::FRONT_LOCKED);
-        ImGui::SameLine();
-        if (ImGui::Button("STROKE DONE"))
-            periHandleEvent(PeriEvent::STROKE_DONE);
-        ImGui::SameLine();
-        if (ImGui::Button("MID LOCKED"))
-            periHandleEvent(PeriEvent::MID_LOCKED);
-        ImGui::SameLine();
-        if (ImGui::Button("RETRACT DONE"))
-            periHandleEvent(PeriEvent::RETRACT_DONE);
+        ImGui::TextUnformatted("Arm (placeholder)");
+        ImGui::SliderFloat("Arm Payload (kg)", &inputs.armPayloadKg, 0.0f, 8.0f, "%.1f");
         ImGui::Separator();
-        ImGui::TextUnformatted("Obstacle Avoid (90°)");
-        ImGui::Checkbox("Show Obstacle", &obstacleVisible);
-        ImGui::SliderFloat("Obstacle X", &obstacleCenter.x, -20.0f, 20.0f, "%.2f");
-        ImGui::SliderFloat("Obstacle Y", &obstacleCenter.y, -10.0f, 10.0f, "%.2f");
-        ImGui::SliderFloat("Obstacle Z", &obstacleCenter.z, -20.0f, 20.0f, "%.2f");
-        ImGui::SliderFloat("Obstacle Radius (m)", &obstacleRadius_m, 0.05f, 5.0f, "%.2f");
-        ImGui::SliderFloat("Clearance (m)", &obstacleClearance_m, 0.05f, 2.0f, "%.2f");
-        ImGui::SliderFloat("Turn Radius (m)", &autopilotTurnRadius_m, 0.5f, 8.0f, "%.2f");
-        // Mirror plan requests here so menu items trigger these too
-        if (reqPlanLeft || ImGui::Button("Plan 90° Left"))
+        if (ImGui::Button("Export CSV"))
         {
-            reqPlanLeft = false;
-            if (!scene.renderables.empty())
-            {
-                autopilotTurnRadius_m = std::max(autopilotTurnRadius_m, minBendRadius_m);
-                const Engine::Math::Vec3 hp = scene.renderables[0].transform.position;
-                float pr = sj_pitch_cur_deg * 3.1415926535f / 180.0f;
-                float yr = sj_yaw_cur_deg * 3.1415926535f / 180.0f;
-                float cp = std::cos(pr), sp = std::sin(pr);
-                float cyh = std::cos(yr), syh = std::sin(yr);
-                Engine::Math::Vec3 fwd{syh * cp, -sp, cyh * cp};
-                Engine::Math::Vec3 toObs = obstacleCenter - hp;
-                float forwardDist = Engine::Math::dot(toObs, fwd);
-                float margin = obstacleRadius_m + obstacleClearance_m + autopilotTurnRadius_m;
-                float L1 = std::max(forwardDist - margin, 0.0f);
-                float L2 = 2.0f * margin;
-                apPlan.clear();
-                apIndex = 0;
-                apSegProgress_m = 0.0f;
-                apHoldYaw_deg = sj_yaw_cur_deg;
-                apHoldPitch_deg = sj_pitch_cur_deg;
-                autopilotActive = true;
-                spinning = true;
-                peristalsisState = PeriState::STROKE;
-                autopilotProgress_m = 0.0f;
-                lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
-                float startYaw = apHoldYaw_deg;
-                if (L1 > 0.02f)
-                    apPlan.push_back({SegStraight, L1, false, 0.0f});
-                apPlan.push_back({SegTurn, 0.0f, false, startYaw + 90.0f});
-                apPlan.push_back({SegStraight, L2, false, 0.0f});
-                apPlan.push_back({SegTurn, 0.0f, false, startYaw});
-            }
+            // TODO: export recent series and current inputs/outputs to CSV
         }
-        ImGui::SameLine();
-        if (reqPlanRight || ImGui::Button("Plan 90° Right"))
-        {
-            reqPlanRight = false;
-            if (!scene.renderables.empty())
-            {
-                autopilotTurnRadius_m = std::max(autopilotTurnRadius_m, minBendRadius_m);
-                const Engine::Math::Vec3 hp = scene.renderables[0].transform.position;
-                float pr = sj_pitch_cur_deg * 3.1415926535f / 180.0f;
-                float yr = sj_yaw_cur_deg * 3.1415926535f / 180.0f;
-                float cp = std::cos(pr), sp = std::sin(pr);
-                float cyh = std::cos(yr), syh = std::sin(yr);
-                Engine::Math::Vec3 fwd{syh * cp, -sp, cyh * cp};
-                Engine::Math::Vec3 toObs = obstacleCenter - hp;
-                float forwardDist = Engine::Math::dot(toObs, fwd);
-                float margin = obstacleRadius_m + obstacleClearance_m + autopilotTurnRadius_m;
-                float L1 = std::max(forwardDist - margin, 0.0f);
-                float L2 = 2.0f * margin;
-                apPlan.clear();
-                apIndex = 0;
-                apSegProgress_m = 0.0f;
-                apHoldYaw_deg = sj_yaw_cur_deg;
-                apHoldPitch_deg = sj_pitch_cur_deg;
-                autopilotActive = true;
-                spinning = true;
-                peristalsisState = PeriState::STROKE;
-                autopilotProgress_m = 0.0f;
-                lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
-                float startYaw = apHoldYaw_deg;
-                if (L1 > 0.02f)
-                    apPlan.push_back({SegStraight, L1, false, 0.0f});
-                apPlan.push_back({SegTurn, 0.0f, false, startYaw - 90.0f});
-                apPlan.push_back({SegStraight, L2, false, 0.0f});
-                apPlan.push_back({SegTurn, 0.0f, false, startYaw});
-            }
-        }
-        if (reqPlanDown || ImGui::Button("Plan 90° Down"))
-        {
-            reqPlanDown = false;
-            if (!scene.renderables.empty())
-            {
-                autopilotTurnRadius_m = std::max(autopilotTurnRadius_m, minBendRadius_m);
-                const Engine::Math::Vec3 hp = scene.renderables[0].transform.position;
-                float pr = sj_pitch_cur_deg * 3.1415926535f / 180.0f;
-                float yr = sj_yaw_cur_deg * 3.1415926535f / 180.0f;
-                float cp = std::cos(pr), sp = std::sin(pr);
-                float cyh = std::cos(yr), syh = std::sin(yr);
-                Engine::Math::Vec3 fwd{syh * cp, -sp, cyh * cp};
-                Engine::Math::Vec3 toObs = obstacleCenter - hp;
-                float forwardDist = Engine::Math::dot(toObs, fwd);
-                float margin = obstacleRadius_m + obstacleClearance_m + autopilotTurnRadius_m;
-                float L1 = std::max(forwardDist - margin, 0.0f);
-                float L2 = 2.0f * margin;
-                apPlan.clear();
-                apIndex = 0;
-                apSegProgress_m = 0.0f;
-                apHoldYaw_deg = sj_yaw_cur_deg;
-                apHoldPitch_deg = sj_pitch_cur_deg;
-                autopilotActive = true;
-                spinning = true;
-                peristalsisState = PeriState::STROKE;
-                autopilotProgress_m = 0.0f;
-                lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
-                float startPitch = apHoldPitch_deg;
-                if (L1 > 0.02f)
-                    apPlan.push_back({SegStraight, L1, true, 0.0f});
-                apPlan.push_back({SegTurn, 0.0f, true, startPitch + 90.0f});
-                apPlan.push_back({SegStraight, L2, true, 0.0f});
-                apPlan.push_back({SegTurn, 0.0f, true, startPitch});
-            }
-        }
-        ImGui::SameLine();
-        if (reqPlanUp || ImGui::Button("Plan 90° Up"))
-        {
-            reqPlanUp = false;
-            if (!scene.renderables.empty())
-            {
-                autopilotTurnRadius_m = std::max(autopilotTurnRadius_m, minBendRadius_m);
-                const Engine::Math::Vec3 hp = scene.renderables[0].transform.position;
-                float pr = sj_pitch_cur_deg * 3.1415926535f / 180.0f;
-                float yr = sj_yaw_cur_deg * 3.1415926535f / 180.0f;
-                float cp = std::cos(pr), sp = std::sin(pr);
-                float cyh = std::cos(yr), syh = std::sin(yr);
-                Engine::Math::Vec3 fwd{syh * cp, -sp, cyh * cp};
-                Engine::Math::Vec3 toObs = obstacleCenter - hp;
-                float forwardDist = Engine::Math::dot(toObs, fwd);
-                float margin = obstacleRadius_m + obstacleClearance_m + autopilotTurnRadius_m;
-                float L1 = std::max(forwardDist - margin, 0.0f);
-                float L2 = 2.0f * margin;
-                apPlan.clear();
-                apIndex = 0;
-                apSegProgress_m = 0.0f;
-                apHoldYaw_deg = sj_yaw_cur_deg;
-                apHoldPitch_deg = sj_pitch_cur_deg;
-                autopilotActive = true;
-                spinning = true;
-                peristalsisState = PeriState::STROKE;
-                autopilotProgress_m = 0.0f;
-                lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
-                float startPitch = apHoldPitch_deg;
-                if (L1 > 0.02f)
-                    apPlan.push_back({SegStraight, L1, true, 0.0f});
-                apPlan.push_back({SegTurn, 0.0f, true, startPitch - 90.0f});
-                apPlan.push_back({SegStraight, L2, true, 0.0f});
-                apPlan.push_back({SegTurn, 0.0f, true, startPitch});
-            }
-        }
-        ImGui::Separator();
-        ImGui::TextUnformatted("Autopilot");
-        ImGui::SliderFloat("Target Forward (m)", &autopilotTarget_m, 0.0f, 50.0f, "%.2f");
-        if (reqStartDrill || ImGui::Button("Start Drill"))
-        {
-            reqStartDrill = false;
-            apPlan.clear();
-            apIndex = -1;
-            apSegProgress_m = 0.0f;
-            autopilotActive = true;
-            autopilotProgress_m = 0.0f;
-            lastHeadPosForProgress = Engine::Math::Vec3{1e9f, 1e9f, 1e9f};
-            spinning = true;
-            peristalsisState = PeriState::STROKE;
-        }
-        ImGui::SameLine();
-        if (reqStop || ImGui::Button("Stop"))
-        {
-            reqStop = false;
-            apPlan.clear();
-            apIndex = -1;
-            apSegProgress_m = 0.0f;
-            autopilotActive = false;
-            spinning = false;
-            peristalsisState = PeriState::IDLE;
-        }
-        ImGui::Text("Progress: %.2f / %.2f m", autopilotProgress_m, autopilotTarget_m);
         ImGui::End();
 
-        // Micro-Borer Parameters removed (length/radius/tooth profile)
+        // Micro-Borer parameters removed
 
         // End main dockspace window
         ImGui::End();

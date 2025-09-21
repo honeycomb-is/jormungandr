@@ -54,7 +54,6 @@ add_executable(Honeycomb
     src/engine/scene/Scene.hpp
     src/engine/scene/SceneBuilder.hpp
     src/engine/render/RenderPrimitives.hpp
-    src/engine/species/Entities.hpp
     ${IMGUI_SOURCES}
 )
 
