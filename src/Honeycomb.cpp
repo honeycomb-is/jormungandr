@@ -253,58 +253,50 @@ namespace Honeycomb
                 // Net force acts along slope direction in world coordinates
                 float cos_slope = std::cos(theta);
                 float sin_slope = std::sin(theta);
-                float F_net_world = F_motor_target + F_grav - F_rr - F_aero_inst;
+
+                // Rolling resistance only applies when there's motion
+                float current_speed = std::sqrt(velocityX_mps * velocityX_mps + velocityY_mps * velocityY_mps);
+                float F_rr_dynamic = (current_speed > 0.001f) ? F_rr : 0.0f;
+
+                // Aerodynamic drag only applies when there's motion (already calculated correctly)
+                float F_aero_dynamic = (current_speed > 0.001f) ? F_aero_inst : 0.0f;
+
+                float F_net_world = F_motor_target + F_grav - F_rr_dynamic - F_aero_dynamic;
 
                 if (brakesApplied)
                 {
-                    // Maximum braking force available from all wheels
-                    float F_brake_max = inputs.mu * W * std::cos(theta);
-                    float v_mag = std::sqrt(velocityX_mps * velocityX_mps + velocityY_mps * velocityY_mps);
-
-                    if (v_mag > 0.001f)
-                    {
-                        // Apply braking force directly opposite to motion along slope direction
-                        float brake_force_along_slope = F_brake_max;
-                        if (v_mag < 0.1f)
-                            brake_force_along_slope *= 3.0f; // Extra braking at low speeds
-
-                        // Determine if we're moving uphill or downhill and oppose accordingly
-                        float velocity_along_slope = velocityX_mps * cos_slope + velocityY_mps * sin_slope;
-                        if (velocity_along_slope > 0.0f)
-                            F_net_world -= brake_force_along_slope; // Moving upslope, brake downslope
-                        else if (velocity_along_slope < 0.0f)
-                            F_net_world += brake_force_along_slope; // Moving downslope, brake upslope
-
-                        // Direct velocity damping for very effective braking
-                        velocityX_mps *= (1.0f - 10.0f * dt); // Strong velocity damping
-                        velocityY_mps *= (1.0f - 10.0f * dt);
-                    }
-                    else
-                    {
-                        // At very low speeds, lock the wheels completely
-                        velocityX_mps = 0.0f;
-                        velocityY_mps = 0.0f;
-                        accelX_mps2 = 0.0f;
-                        accelY_mps2 = 0.0f;
-                        F_net_world = 0.0f; // No forces when locked
-                    }
-                }
-                float F_x = F_net_world * cos_slope; // force component along +X (right)
-                float F_y = F_net_world * sin_slope; // force component along +Y (up)
-
-                accelX_mps2 = F_x / std::max(1.0f, mass);
-                accelY_mps2 = F_y / std::max(1.0f, mass);
-
-                velocityX_mps += accelX_mps2 * dt;
-                velocityY_mps += accelY_mps2 * dt;
-
-                // Damping for very small velocities
-                if (std::fabs(velocityX_mps) < 0.0005f)
+                    // When brakes are applied, trolley stops and stays stopped
+                    // This overrides all other forces including gravity on slopes
                     velocityX_mps = 0.0f;
-                if (std::fabs(velocityY_mps) < 0.0005f)
                     velocityY_mps = 0.0f;
+                    accelX_mps2 = 0.0f;
+                    accelY_mps2 = 0.0f;
+                    actualSpeed_mps = 0.0f;
+                }
+                else
+                {
+                    // Only apply physics when brakes are NOT applied
+                    float F_x = F_net_world * cos_slope; // force component along +X (right)
+                    float F_y = F_net_world * sin_slope; // force component along +Y (up)
 
-                actualSpeed_mps = std::sqrt(velocityX_mps * velocityX_mps + velocityY_mps * velocityY_mps);
+                    accelX_mps2 = F_x / std::max(1.0f, mass);
+                    accelY_mps2 = F_y / std::max(1.0f, mass);
+
+                    velocityX_mps += accelX_mps2 * dt;
+                    velocityY_mps += accelY_mps2 * dt;
+
+                    actualSpeed_mps = std::sqrt(velocityX_mps * velocityX_mps + velocityY_mps * velocityY_mps);
+                }
+
+                // Damping for very small velocities (only if brakes not applied)
+                if (!brakesApplied)
+                {
+                    if (std::fabs(velocityX_mps) < 0.0005f)
+                        velocityX_mps = 0.0f;
+                    if (std::fabs(velocityY_mps) < 0.0005f)
+                        velocityY_mps = 0.0f;
+                }
+
                 speedUsed_mps = actualSpeed_mps;
             }
             else
@@ -320,24 +312,15 @@ namespace Honeycomb
                 accelX_mps2 = (velocityX_mps - oldVelX) / std::max(0.001f, dt);
                 accelY_mps2 = (velocityY_mps - oldVelY) / std::max(0.001f, dt);
 
-                // Brakes can override motor - apply strong braking even when motor is on
+                // Brakes can override motor - completely stop the trolley
                 if (brakesApplied)
                 {
-                    float v_mag = std::sqrt(velocityX_mps * velocityX_mps + velocityY_mps * velocityY_mps);
-                    if (v_mag > 0.001f)
-                    {
-                        // Strong braking dampens velocity directly
-                        velocityX_mps *= (1.0f - 12.0f * dt); // Very strong braking with motor on
-                        velocityY_mps *= (1.0f - 12.0f * dt);
-                        actualSpeed_mps = std::sqrt(velocityX_mps * velocityX_mps + velocityY_mps * velocityY_mps);
-                    }
-                    else
-                    {
-                        // Complete stop
-                        velocityX_mps = 0.0f;
-                        velocityY_mps = 0.0f;
-                        actualSpeed_mps = 0.0f;
-                    }
+                    // Brakes override everything - complete stop
+                    velocityX_mps = 0.0f;
+                    velocityY_mps = 0.0f;
+                    accelX_mps2 = 0.0f;
+                    accelY_mps2 = 0.0f;
+                    actualSpeed_mps = 0.0f;
                 }
             }
 
@@ -448,16 +431,18 @@ namespace Honeycomb
             arrow(frontContact, ImVec2(-v.x, -v.y), scaleF(Nf), IM_COL32(20, 100, 180, 255)); // Dark blue
             // Weight (down vertical)
             arrow(cg, ImVec2(0, 1), scaleF(W), IM_COL32(180, 20, 20, 255)); // Dark red
-            // Drive/traction vectors: horizontal screen-space (right=+X), flip by travel direction
-            if (F_rear > 0.0f)
+            // Drive/traction vectors: show direction based on actual drive force sign
+            // Positive force = pushing trolley forward (rightward), so wheel pushes backward against ground (leftward)
+            // Negative force = holding trolley back, so wheel pushes forward against ground (rightward)
+            if (std::fabs(F_rear) > 1e-3f)
             {
-                ImVec2 dir = (actualSpeed_mps >= 0.0f) ? ImVec2(-1.0f, 0.0f) : ImVec2(1.0f, 0.0f);
-                arrow(rearContact, dir, scaleF(F_rear), IM_COL32(20, 120, 20, 255)); // Dark green
+                ImVec2 dir = (F_rear > 0.0f) ? ImVec2(-1.0f, 0.0f) : ImVec2(1.0f, 0.0f);
+                arrow(rearContact, dir, scaleF(std::fabs(F_rear)), IM_COL32(20, 120, 20, 255)); // Dark green
             }
-            if (F_front > 0.0f)
+            if (std::fabs(F_front) > 1e-3f)
             {
-                ImVec2 dir = (actualSpeed_mps >= 0.0f) ? ImVec2(-1.0f, 0.0f) : ImVec2(1.0f, 0.0f);
-                arrow(frontContact, dir, scaleF(F_front), IM_COL32(20, 120, 20, 255)); // Dark green
+                ImVec2 dir = (F_front > 0.0f) ? ImVec2(-1.0f, 0.0f) : ImVec2(1.0f, 0.0f);
+                arrow(frontContact, dir, scaleF(std::fabs(F_front)), IM_COL32(20, 120, 20, 255)); // Dark green
             }
 
             // Torque arc magnitude and direction at each wheel
